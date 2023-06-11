@@ -8,16 +8,16 @@ WORKDIR /app
 RUN git clone https://github.com/vishalsiram/sherlock_pipeline.git /app/repository
 
 # Copy the code file and pickle files from the cloned repository
-COPY /app/repository/app.py
-COPY /app/repository/tfidf_remitter_name_m3.pkl
-COPY /app/repository/tfidf_source_m3.pkl
-COPY /app/repository/tfidf_base_txn_text_m3.pkl
-COPY /app/repository/tfidf_mode_m3.pkl
-COPY /app/repository/tfidf_benef_name_m3.pkl
-COPY /app/repository/classifier_m3.pkl
+COPY /app/repository/app.py /app/
+COPY /app/repository/tfidf_remitter_name_m3.pkl /app/
+COPY /app/repository/tfidf_source_m3.pkl /app/
+COPY /app/repository/tfidf_base_txn_text_m3.pkl /app/
+COPY /app/repository/tfidf_mode_m3.pkl /app/
+COPY /app/repository/tfidf_benef_name_m3.pkl /app/
+COPY /app/repository/classifier_m3.pkl /app/
 
 # Copy the requirements.txt file from the cloned repository
-COPY requirements.txt 
+COPY requirements.txt /app/
 
 # Install the required packages
 RUN pip install --no-cache-dir -r requirements.txt
