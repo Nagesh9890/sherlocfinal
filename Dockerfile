@@ -12,12 +12,12 @@ RUN ls -la /app/repository
 
 # Copy the code file and pickle files from the cloned repository
 COPY app.py /app/
-COPY /app/repository/tfidf_remitter_name_m3.pkl /app/
-COPY /app/repository/tfidf_source_m3.pkl /app/
-COPY /app/repository/tfidf_base_txn_text_m3.pkl /app/
-COPY /app/repository/tfidf_mode_m3.pkl /app/
-COPY /app/repository/tfidf_benef_name_m3.pkl /app/
-COPY /app/repository/classifier_m3.pkl /app/
+COPY tfidf_remitter_name_m3.pkl /app/
+COPY tfidf_source_m3.pkl /app/
+COPY tfidf_base_txn_text_m3.pkl /app/
+COPY tfidf_mode_m3.pkl /app/
+COPY tfidf_benef_name_m3.pkl /app/
+COPY classifier_m3.pkl /app/
 
 # Debug - List files in the app directory
 RUN ls -la /app
