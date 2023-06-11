@@ -11,7 +11,7 @@ RUN git clone https://github.com/vishalsiram/sherlock_pipeline.git /app/reposito
 RUN ls -la /app/repository
 
 # Copy the code file and pickle files from the cloned repository
-COPY /app/repository/app.py /app/
+COPY app.py /app/
 COPY /app/repository/tfidf_remitter_name_m3.pkl /app/
 COPY /app/repository/tfidf_source_m3.pkl /app/
 COPY /app/repository/tfidf_base_txn_text_m3.pkl /app/
