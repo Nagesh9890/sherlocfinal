@@ -14,7 +14,7 @@ COPY /app/repository/tfidf_source_m3.pkl /app/
 COPY /app/repository/tfidf_base_txn_text_m3.pkl /app/
 COPY /app/repository/tfidf_mode_m3.pkl /app/
 COPY /app/repository/tfidf_benef_name_m3.pkl /app/
-COPY /app/repository/classifier_m3.pkl/app/
+COPY /app/repository/classifier_m3.pkl /app/
 
 # Copy the requirements.txt file from the cloned repository
 COPY requirements.txt /app/
