@@ -1,19 +1,14 @@
 pipeline {
   agent any
   stages {
-    stage('version') {
+    stage('Version') {
       steps {
         sh 'python3 --version'
       }
     }
-    stage('Install Dependencies') {
+    stage('Build Docker Image') {
       steps {
-        sh 'pip3 install -r requirements.txt'
-      }
-    }
-    stage('hello') {
-      steps {
-        sh 'python3 app.py'
+        sh 'docker build -t myimage:latest .'
       }
     }
   }
