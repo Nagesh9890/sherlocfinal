@@ -30,3 +30,48 @@ spec:
       port: 80
       targetPort: 5000
   type: LoadBalancer
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mlops-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mlops-deployment
+  minReplicas: 1
+  maxReplicas: 5  # You can adjust the maximum number of replicas as needed
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50  # Adjust this value as needed (50% CPU utilization)
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mlops-ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: mlops-service
+                port:
+                  number: 80
+          - path: /v2
+            pathType: Prefix
+            backend:
+              service:
+                name: mlops-service
+                port:
+                  number: 5000
+  # Add annotations for traffic splitting if your Kubernetes cluster supports it
+  # For example, you can use annotations like "nginx.ingress.kubernetes.io/canary", "nginx.ingress.kubernetes.io/canary-weight", etc.
