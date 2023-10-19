@@ -73,5 +73,3 @@ spec:
                 name: mlops-service
                 port:
                   number: 5000
-  # Add annotations for traffic splitting if your Kubernetes cluster supports it
-  # For example, you can use annotations like "nginx.ingress.kubernetes.io/canary", "nginx.ingress.kubernetes.io/canary-weight", etc.
