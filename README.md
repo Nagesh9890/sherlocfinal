@@ -1,3 +1,13 @@
+Hi Kiran,
+
+As discussed in last call, we are going through existing classification jobs and also identifying the optimized solution and tagging logic. Currently we went through the RTGS and classification framework for the same, other mode of transaction classification.
+
+We will send you the detailed report of existing framework by next Wednesday and Friday we can showcase the demo.
+
+
+
+
+--------------------------------------------------------------------------------
 Self Transfer -
 
 import pyspark.sql.functions as F
