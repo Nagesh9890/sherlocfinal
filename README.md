@@ -1,28 +1,346 @@
-Subject: Update on Transaction Classification Framework Review and Upcoming Demonstration
+Remarks.py
 
-Dear Kiran,
+import os, io, re, csv
+import string
+from collections import Counter
+from itertools import permutations,chain
+import time
+#from textutils.viktext import KeywordProcessor
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+from pyspark.context import SparkContext
+from pyspark.sql import SQLContext, HiveContext
+import pyspark
+from pyspark.storagelevel import StorageLevel
+from pyspark.sql.window import Window
+import ConfigParser
+import sys
+#sc.addPyFile("textutils/viktext.py")
+#from viktext import KeywordProcessor
 
-I hope this message finds you well.
 
-In continuation of our previous discussions, our team is meticulously analyzing the existing classification protocols for RTGS and NEFT transactions. Alongside, we are exploring other transaction classification methods to ensure a holistic evaluation.
+class RemarksFW():
+    def __init__(self, kp_b, result_dict_b, default_cat):
+        self.kp_b = kp_b
+        self.result_dict_b = result_dict_b
+        self.default_cat = default_cat
+        
+    def get_branch(self, start, end, startswith, category_set, level):
+        rem = ''
+        c2 = Counter([x[start:end] for x in category_set if x.startswith(startswith) and x[start:end] != '00'])
+        level2 = [x[0] for x in c2.most_common(5)]
+        if len(level2) == 1:
+            l2 = level2[0]
+        elif len(level2) == 0:
+            l2 = '00'
+        else:
+            l2 = '00'
+            rem += 'Conflict at level ' + level + ' '
+        return l2, rem
 
-To ensure transparency and keep you informed on our progress, here are the key updates and plans for next week:
+    def resolve_deeper(self, start, end, category_set):
+    #     print start, end, category_set[0][start:end], category_set[1][start:end]
+        if category_set[0][start:end] != '00' and category_set[1][start:end] == '00':
+            return category_set[0]
+        elif category_set[0][start:end] == '00' and category_set[1][start:end] != '00':
+            return category_set[1]
 
-Date: [Insert Date for Next Wednesday]
-Current Framework Overview: We will present a detailed exposition on the workings of the existing transaction classification framework.
-Improvements and Enhancements: An in-depth discussion on the refinements we've made to improve accuracy and efficiency.
-Corporate Transactions: A special highlight on the classifications concerning Corporate transactions, detailing the new integrated features and adjustments.
-Additionally, we've scheduled a live demonstration on Date: [Insert Date for Next Friday] to offer you a firsthand look at these updates. This session will also be an opportunity for you to raise any questions or provide feedback.
 
-We highly value your collaboration and eagerly await your insights during next week's sessions.
+    def get_deepest_category_among_two(self, category_set):
+        res = self.resolve_deeper(4,6, category_set)
+        if res is None:
+            res = self.resolve_deeper(2,4, category_set)
+        return res
 
-Warm regards,
+    
+    def conflict_resolver(self, category_set):
+        category_set = list(category_set)
 
-[Your Name]
-[Your Position]
-[Your Company Name]
-[Contact Information]
+        if len(category_set) == 0:
+            return self.default_cat, "No match Found"
+        else:
+            common_two = Counter(category_set).most_common(2)
+            if len(common_two) == 2 and common_two[0][1] == common_two[1][1] and common_two[0][0][:2] != common_two[1][0][:2]:
+                category_set = [x[0] for x in common_two]
+                category = self.get_deepest_category_among_two(category_set)
+                if category:
+                    return category, "Resolved to deeper between two different primary categories"
+                else:
+                    return self.default_cat, 'Conflict couldnot be resolved'
+            else:    
+                remark = ''
+                c = Counter([x[:2] for x in category_set])
+                l1 = c.most_common(1)[0][0]
+                category_set = list(set(category_set))
+                l2, rem = self.get_branch(2, 4, l1, category_set, '2')
+                remark += rem
+                l3, rem = self.get_branch(4, 6, l1+l2, category_set, '3')
+                remark += rem
+                return l1+l2+l3, remark.strip()
+    
+    def registerudf(self):
+        return F.udf(self.main_remarks_category, T.StringType())
 
+    def main_remarks_category_old(self, remark):
+        try:
+            if remark:
+                words=self.kp_b.value.extract_keywords(remark)
+                words_set = set(words)
+                res = []
+                for ele in words_set:
+                    for set1 in self.result_dict_b.value[ele]:
+                        if ((words_set >= set(set1))):
+                            res.append(self.result_dict_b.value[ele][set1])
+                r = self.conflict_resolver(res)[0]
+                return r
+            else:
+                return self.default_cat
+        except:
+            return self.default_cat
+    
+    def main_remarks_category(self, remark):        
+        if remark:
+            words=self.kp_b.value.extract_keywords(remark)
+            words_set = set(words)
+            res = []
+            for ele in words_set:
+                for set1 in self.result_dict_b.value[ele]:
+                    if ((words_set >= set(set1))):
+                        res.append(self.result_dict_b.value[ele][set1])
+            #print 'Matched Categories-', res
+            if len(res) == 0:
+                return self.default_cat
+            res_res = Counter(res).most_common()
+            if len(res_res) == 1:
+                #print 'after conflict resolution-', res_res[0][0]
+                return res_res[0][0]
+            
+            elif len(res_res) == 2 and res_res[0][0].startswith('13') and not res_res[1][0].startswith('13'):
+                return res_res[1][0]
+
+            elif len(res_res) == 2 and res_res[1][0].startswith('13') and not res_res[0][0].startswith('13'):
+                return res_res[0][0]
+                
+            elif Counter(res).most_common()[0][1] > Counter(res).most_common()[1][1]*2:
+                #print 'after conflict resolution-', res_res[0][0]
+                return res_res[0][0]
+            else:
+                r = self.conflict_resolver(res)[0]
+                #print 'after conflict resolution-', r
+                return r
+        else:
+            return self.default_cat
+    
+        
+    def main_remarks_category_tester(self, remark):        
+        if remark:
+            words=self.kp_b.value.extract_keywords(remark)
+            words_set = set(words)
+            res = []
+            for ele in words_set:
+                for set1 in self.result_dict_b.value[ele]:
+                    if ((words_set >= set(set1))):
+                        res.append(self.result_dict_b.value[ele][set1])
+            print 'Matched Categories-', res
+            if len(res) == 0:
+                print self.default_cat
+                return self.default_cat
+            res_res = Counter(res).most_common()
+            if len(res_res) == 1:
+                print 'after conflict resolution-', res_res[0][0]
+                return res_res[0][0]
+            elif Counter(res).most_common()[0][1] > Counter(res).most_common()[1][1]*2:
+                print 'after conflict resolution-', res_res[0][0]
+                return res_res[0][0]
+            else:
+                r = self.conflict_resolver(res)[0]
+                print 'after conflict resolution-', r
+                return r
+        else:
+            return self.default_cat
+
+            
+def R_combine(a_list):
+    res = []
+    for i, ele in enumerate(a_list):
+        k = ''.join(a_list[:i]) + ' ' + ''.join(a_list[i:])
+        res.append(k.strip()) 
+    return res
+
+def R_combine2(a_list):
+    res = []
+    for i, ele in enumerate(a_list):
+        k = ''.join(a_list[:i]) + ' ' + ''.join(a_list[i:])
+        k2 = ''.join(a_list[:i])  + ' '+ ''.join(a_list[i:]) +'s'
+        res.append(k.strip())
+        res.append(k2.strip()) 
+    return res 
+
+
+    
+def R_get_keywords_from_csv(filename):
+    result_dict = {}
+    cat_key_mapp={}
+    from itertools import permutations,chain
+    with open(filename, 'rb') as filereader:
+        rd = csv.reader(filereader)
+        for line in rd:
+            code = line[3]
+            keywords = line[4].lower().replace('[','') \
+                              .replace(']','').replace("'","").replace('0', '').replace('\n', '').strip().split(',')
+            cat_key_mapp[code]=(line[1]+" "+line[2]).strip()
+            for ele in keywords:
+                if len(ele.strip()) > 1:
+                    if len(ele.split()) > 2:
+                        k2 = [R_combine(x) for x in list(permutations(ele.split()))]
+                        merged = list(chain(*k2))
+                        merged.append(ele)
+                    else:
+                        k2 = [R_combine2(x) for x in list(permutations(ele.split()))]
+                        merged = set(list(chain(*k2)))
+                    for elem in merged:    
+                        k1 = elem.split(' ')
+                        for k11 in k1:
+                            if k11 != '':
+                                k11.strip()
+                                if k11 not in result_dict:
+                                    result_dict[k11] = {}
+                                result_dict[k11][tuple(elem.split())] = code
+    return result_dict
+
+def R_initialize(root_path, sc, fname = '/Transaction-Classification/MasterData/Txn_Classification_28March.csv'):
+    """
+    root_path -> directory where Transaction-Classification folder is present
+    sc -> spark context
+    fname -> path to csv containing remarks master, default: './Transaction-Classification/MasterData/Txn_Classification_28March.csv'
+    """
+    sc.addPyFile(root_path + '/Transaction-Classification/textutils/viktext.py')
+    from viktext import KeywordProcessor
+    result_dict = R_get_keywords_from_csv(root_path + fname)
+    kp = KeywordProcessor()
+    kp.add_keywords_from_list([k for k in result_dict])
+    return kp, result_dict
+    
+
+def R_textcleaner2(df, col_name, regex_list = [r'[^A-Za-z]+', r'\bNULL\b', r'\s+'], i = 0):
+    if i == len(regex_list):
+        return df.withColumn('Remarks_clean', F.upper(F.trim(col_name)))    
+    else:
+        funct = F.regexp_replace(col_name, regex_list[i], ' ')
+        return R_textcleaner2(df, col_name = funct, i = i+1)
+    
+def R_extractRegex2(default, benif_col, regex_list,  i = 0):
+    if i == len(regex_list):
+        return default
+    else:
+        return F.when(benif_col.rlike(regex_list[i][0]),regex_list[i][1]) \
+                .otherwise(R_extractRegex2(default, benif_col, regex_list, i = i+1))
+    
+def R_get_txn_class_remark(root_path, sc, df, remark_col, category_col, kp, result_dict, default_cat = '510000', R_name=None, B_name=None, self_transfer_flag_col = '__temp_self__', broadcasting=False):
+    """
+    root_path -> directory where Transaction-Classification folder is present
+    sc -> Spark context
+    df -> Transaction Dataframe
+    remark_col -> column name which would contain textual information about transaction
+    category_col -> output column name which will be populated with category code (ensure this column doen't pre-exist in df)
+    kp -> Keyword processor object you get through initilization
+    result_dict -> dictonary you get through initilization
+    default_cat -> Default category code
+    R_name -> column containing Remitter name
+    B_name -> column containing Beneficiary name
+    self_transfer_flag_col -> output column which would contain self transfer flag (0/1)
+        
+    **IMP: don't forget to add jar incase you are calculating self flag -> ./jars/subset_udf.jar**
+
+    """
+    sc.addPyFile(root_path + '/Transaction-Classification/selfTransferFW.py')
+    from selfTransferFW import *
+    #kp = kp1
+    #result_dict = result_dict1
+    kp_b = sc.broadcast(kp)
+    result_dict_b = sc.broadcast(result_dict)
+    R_fw = RemarksFW(kp_b, result_dict_b, default_cat)
+    main_remarks_categoryUDF = R_fw.registerudf()
+    
+    ff = R_textcleaner2(df, F.col(remark_col))
+    ff = ff.fillna('NA', subset=['Remarks_clean'])
+    df_remarks_clean = ff.select(F.col('Remarks_clean')).dropDuplicates(['Remarks_clean'])
+    
+    res = df_remarks_clean.withColumn(category_col, main_remarks_categoryUDF(F.col('Remarks_clean')))
+    res = res.filter( ( (F.col(category_col) != default_cat) | 
+                        (~F.col(category_col).isNull() ) 
+                      ) )
+    
+    
+    if broadcasting == True:
+        #experiment
+        res = res.cache()
+        print (res.count())
+        df_joined = ff.join(F.broadcast(res), 'Remarks_clean', 'left')
+    else:
+        df_joined = ff.join(res, 'Remarks_clean', 'left')
+    #df_joined2 =  df_joined.drop(F.col('Remarks_clean'))
+    R_regex_list = [[r'((?i).*[A-Za-z]{3}\s*(sal|salary)\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))', '180100']]
+    
+    if R_name != None and B_name != None and self_transfer_flag_col != None:
+        df_joined2 = getSelfTransferFlag(sc, df_joined, R_name, B_name, self_transfer_flag_col)
+    
+        df_final = df_joined2.withColumn(category_col, F.when(((F.col(category_col) == default_cat) &
+                                                          (F.col(self_transfer_flag_col) == 1)), '130100') \
+                                                    .otherwise(F.col(category_col)))
+        df_final = df_final.withColumn(category_col , F.when( (F.col(category_col).isNull()),
+                                                             R_extractRegex2(F.col(category_col), F.col('Remarks_clean'), R_regex_list))
+                                       .otherwise(F.col(category_col)) )
+        
+        #df_final = df_final.withColumn(category_col, R_extractRegex2(F.col(category_col), F.col('Remarks_clean'), R_regex_list))
+                                       
+        
+        
+        df_final = df_final.withColumn(category_col, F.when(F.col(category_col).isNull(),
+                                                              default_cat).otherwise(F.col(category_col))
+                                               )
+        return df_final.drop(F.col('Remarks_clean'))
+    else:
+        df_joined = df_joined.withColumn(category_col , F.when( (F.col(category_col).isNull()), R_extractRegex2(F.col(category_col), F.col('Remarks_clean'), R_regex_list)).otherwise(F.col(category_col)) )
+        #df_joined = df_joined.withColumn(category_col ,R_extractRegex2(F.col(category_col), F.col('Remarks_clean'), R_regex_list))
+        
+        df_joined = df_joined.withColumn(category_col, F.when(F.col(category_col).isNull(),
+                                                              default_cat).otherwise(F.col(category_col))
+                                       )
+                                       
+        return df_joined.drop(F.col('Remarks_clean'))
+'''
+def get_main(sc):
+    csv_file = 'MasterData/Txn_Classification_28March.csv'
+    kp1, result_dict1 = initialize(sc, csv_file)
+    kp_b = sc.broadcast(kp1)
+    result_dict_b = sc.broadcast(result_dict1)
+    R_fw = RemarksFW(kp_b, result_dict_b)
+    main_remarks_categoryUDF = R_fw.registerudf()
+    return main_remarks_categoryUDF
+'''
+
+if __name__ == '__main__':
+    'Following is an example of using This framework-'
+    sc = SparkContext()
+    try:
+        # Try to access HiveConf, it will raise exception if Hive is not added
+        sc._jvm.org.apache.hadoop.hive.conf.HiveConf()
+        sqlContext = HiveContext(sc)
+    except py4j.protocol.Py4JError:
+        sqlContext = SQLContext(sc)
+    except TypeError:
+        sqlContext = SQLContext(sc)
+    
+    kp, result_dict = R_initialize(sc)
+
+    table = 'db_smith.smth_pool_neft'
+    df = sqlContext.read.table(table)
+
+    df_res = R_get_txn_class_remark(sc, df, 'base_txn_text', 'category_code_FW', kp, result_dict)
+    #df_res = df_res
+    #df_res.count()
+    df_res.show()
 
 
 
