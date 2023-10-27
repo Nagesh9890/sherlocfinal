@@ -1,3 +1,195 @@
+# coding: utf-8
+
+# In[72]:
+
+import pandas as pd
+import pyspark
+from pyspark.context import SparkContext
+from pyspark.sql import SQLContext, HiveContext
+from pyspark.storagelevel import StorageLevel
+from pyspark.sql.functions import udf
+from pyspark.sql.types import *
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+from pyspark.sql.functions import udf
+from pyspark.sql import *
+from pyspark.ml import feature as MF
+from dateutil import relativedelta
+import datetime
+import ConfigParser
+import sys
+
+# In[ ]:
+
+sc = SparkContext()
+#sc.setCheckpointDir('/tmp/spark-code-neft')
+
+try:
+    # Try to access HiveConf, it will raise exception if Hive is not added
+    sc._jvm.org.apache.hadoop.hive.conf.HiveConf()
+    sqlContext = HiveContext(sc)
+    sqlContext.setConf("hive.exec.dynamic.partition", "true")
+    sqlContext.setConf("hive.exec.dynamic.partition.mode", "nonstrict")
+except py4j.protocol.Py4JError:
+    sqlContext = SQLContext(sc)
+except TypeError:
+    sqlContext = SQLContext(sc)
+
+
+# In[73]:
+
+configFile = sys.argv[1]
+#configFile = "/data/08/notebooks/tmp/Anisha/Pooling_table/cc_sample.ini"
+config = ConfigParser.ConfigParser()
+config.read(configFile)
+data_dtt = config.get('default', 'MASTER_DATA_DATE_KEY',)
+data_dt = data_dtt.strip('"').strip("'")
+#data_dt='2019-06-02'
+#cust_mst_tbl_name = config.get('contactability','cust_mst_tbl_name')
+cc_tbl = config.get('default','INP_DB_NM_1') + '.' +  config.get('default','INP_TBL_NM_1')   
+cc_tbl_df=sqlContext.table(cc_tbl)
+cc_tbl1= cc_tbl_df.filter(F.col('data_dt')==data_dt).drop('category_code','category_level1','category_level2','category_level3','benef_id')
+
+category_mast_tbl = config.get('default', 'INP_DB_NM_2') + '.' +  config.get('default','INP_TBL_NM_2') 
+category_master = sqlContext.table(category_mast_tbl).drop('batch_id')
+
+#cc_code_mast_tbl = config.get('default', 'INP_DB_NM_3') + '.' +  config.get('default','INP_TBL_NM_3') 
+cc_code_master = sqlContext.table('db_stage.stg_cc_category_mapping')
+
+output_tbl = config.get('default', 'OUT_DB_NM') + '.' +  config.get('default','OUT_TBL_NM_1')
+
+
+# In[17]:
+
+#cc.select(F.col('transaction_sub_cat'),F.col('transaction_net_cat')).distinct().count()
+
+
+# In[18]:
+
+#cc_code_master=sqlContext.table('db_stage.stg_cc_category_mapping')
+
+
+# In[19]:
+
+#category_master=sqlContext.table('db_stage.stg_fle_category_master')
+
+
+# In[74]:
+
+#sc.applicationId
+
+
+# In[75]:
+
+rootpath='/ybl/dwh/artifacts/sherlock/pythonJobs'
+sc.addPyFile(rootpath + '/Transaction-Classification/PosFW.py')
+from PosFW import *
+kp = initialize(rootpath,sc)
+
+
+# In[76]:
+
+#cc_table=sqlContext.table('db_smith.smth_transaction_cc_pool').drop('category_code','category_level1','category_level2','category_level3')
+
+
+# In[77]:
+
+cc_table1=cc_tbl1.filter(F.col('transaction_category').isin('SPENDS'))
+
+
+# In[78]:
+
+cc_table2=get_pos_txn_cat(sc, sqlContext, cc_table1,'nobook_txn_text','mt_category_code','benef_id','category_code', kp)
+
+cc_table2a=cc_table2.withColumn('benef_name',F.trim(
+        F.regexp_replace(
+            F.regexp_replace(F.col('nobook_txn_text'),'[^A-Z0-9_?a-z?]',' '),'  +',' ')
+                                ))
+# In[25]:
+
+#cc_table1.count()
+
+
+# In[26]:
+
+#cc_table2.groupBy('category_code_FW').count().orderBy(F.col('count').desc()).take(200)
+
+
+# In[79]:
+
+cc_table3=cc_tbl1.filter(~(F.col('transaction_category').isin('SPENDS'))|(F.col('transaction_category').isNull()))
+
+
+# In[80]:
+
+cc_table4=cc_table3.join(cc_code_master,['transaction_net_cat','transaction_sub_cat'],'left').withColumn('benef_id',F.lit(''))
+
+
+# In[81]:
+
+cc_all=cc_table2a.select(cc_table2a.columns).unionAll(cc_table4.select(cc_table2a.columns))
+
+
+# In[82]:
+
+cc_all1=(cc_all.withColumn('category_code',F.when(F.col('base_txn_text').like('%PAYMENT%RECEIVED%'),'250000')
+                          .otherwise(F.when(F.col('base_txn_text').like('%REWARDS%REDEMPTION%'),'521900')
+                                     .otherwise(F.col('category_code')))))
+
+
+# In[83]:
+
+cc_all_final=cc_all1.join(category_master,'category_code','left')
+
+
+# In[84]:
+
+pool=sqlContext.table('db_smith.smth_transaction_pool')
+
+
+# In[70]:
+
+final_df=cc_all_final.select(pool.columns)
+
+
+# In[ ]:
+
+final_df.write.insertInto(output_tbl, True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 Remarks.py
 
 import os, io, re, csv
