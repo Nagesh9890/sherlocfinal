@@ -1,3 +1,189 @@
+
+# coding: utf-8
+
+# In[16]:
+
+import pyspark
+from pyspark.context import SparkContext
+from pyspark.sql import SQLContext, HiveContext
+from pyspark.storagelevel import StorageLevel
+import sys
+
+# ---- initializations ----
+
+# create spark context
+sc = SparkContext()
+
+try:
+    # Try to access HiveConf, it will raise exception if Hive is not added
+    sc._jvm.org.apache.hadoop.hive.conf.HiveConf()
+    sqlContext = HiveContext(sc)
+    sqlContext.setConf("hive.exec.dynamic.partition", "true")
+    sqlContext.setConf("hive.exec.dynamic.partition.mode", "nonstrict")
+except py4j.protocol.Py4JError:
+    sqlContext = SQLContext(sc)
+except TypeError:
+    sqlContext = SQLContext(sc)
+
+# for compatibility
+sqlCtx = sqlContext
+
+
+# In[29]:
+
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+from datetime import datetime, timedelta
+from dateutil import relativedelta
+from ConfigParser import ConfigParser
+from dateutil import parser
+from dateutil import relativedelta
+
+
+# In[31]:
+
+#Ini file dynamic variables reading
+configFile = sys.argv[1]
+#configFile = '/data/08/notebooks/tmp/Devesh/RemarkUtil/smth_latest_month_incremental_pool.ini'
+config = ConfigParser()
+config.read(configFile)
+
+
+INP_DB_NM_1 = config.get('default', 'INP_DB_NM_1')
+INP_TBL_NM_1 = config.get('default','INP_TBL_NM_1')
+
+OUT_DB_NM = config.get('default', 'OUT_DB_NM')
+OUT_TBL_NM = config.get('default','OUT_TBL_NM')
+
+folder_name=OUT_TBL_NM.lower()
+
+# In[32]:
+
+current_date = config.get('default','MASTER_DATA_DATE_KEY').replace('"', "").replace("'","")
+transaction_pool_table_name = INP_DB_NM_1+'.'+INP_TBL_NM_1
+incremental_table_name = OUT_DB_NM+'.'+OUT_TBL_NM
+
+
+# In[33]:
+
+q_create_incremental_table ="""create EXTERNAL table if not exists %s
+(
+cod_acct_no string,
+cust_id string,
+source string,
+category_code string,
+d_c string,
+channel string,
+amount_m0 double,
+txn_count_m0 int,
+last_txn_date string,
+last_txn_amount double,
+remitter_ifsc string,
+benef_ifsc string,
+mode string,
+data_dt string
+)
+ROW FORMAT SERDE
+ 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+STORED AS INPUTFORMAT
+ 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+OUTPUTFORMAT
+  'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+LOCATION 'hdfs://nameservice1/ybl/smith/genie/hive/%s'
+"""
+
+
+q_insert_incremental = """select trim(cod_acct_no) as cod_acct_no,
+            cust_id,
+            source,
+            category_code,
+            d_c,
+            channel,
+            sum((cast(amount as float))) as amount_m0,
+            count(channel) txn_count_m0,
+            to_date(max(dat_time_txn)) as last_txn_date,
+            max((cast(amount as float))) as last_txn_amount,
+            substr(remitter_ifsc,1,4) as remitter_ifsc,
+            substr(benef_ifsc,1,4) as benef_ifsc,
+            mode,
+            current_date as data_dt
+      from transaction_pool_table_name
+      where to_date(data_dt)>=(date_add(current_date,1 - day(current_date) )) and
+       to_date(dat_value) between (date_add(current_date,
+             1 - day(current_date) )) and last_day(current_date)
+     group by cod_acct_no, cust_id, source, category_code,d_c,channel,substr(remitter_ifsc,1,4),substr(benef_ifsc,1,4),mode
+     """
+
+def lastOfMonth(dtDateTime):
+    dYear = dtDateTime.strftime("%Y")
+    dMonth = str(int(dtDateTime.strftime("%m"))%12+1)
+    dDay = "01"
+    nextMonth = datetime.strptime(dYear+'-'+dMonth+'-'+dDay,'%Y-%m-%d').date()
+    delta = timedelta(days=1)    #create a delta of 1 second
+    return nextMonth - delta
+
+
+def createQuery(query,incremental_table_name,transaction_pool_table_name):
+    return (query.replace('transaction_pool_table_name',transaction_pool_table_name)
+            .replace('incremental_table_name',incremental_table_name)
+           )
+
+def createAndWriteTable(createQuery,insertQuery,tableName,folder_name,current_date,overwrite_mode=True):
+    sqlContext.sql(createQuery%(tableName,folder_name))
+    insertQuery = insertQuery.replace('current_date', "to_date('%s')"%current_date)
+    cols = sqlContext.table(tableName).columns
+    df = sqlContext.sql(insertQuery).select(cols)
+    df.write.insertInto(tableName, overwrite_mode)
+
+
+def insertTable(insertQuery,tableName,current_date,overwrite_mode=True):
+    insertQuery = insertQuery.replace('current_date', "to_date('%s')"%current_date)
+    df = sqlContext.sql(insertQuery)
+    cols = sqlContext.table(tableName).columns
+    df = df.select(cols)
+    df.write.insertInto(tableName, overwrite_mode)
+
+
+def runOneTimeTxn(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date):
+    try :
+        df = sqlContext.table(incremental_table_name)
+        data_dt = sqlContext.table(incremental_table_name).select('data_dt').orderBy(F.col('data_dt').desc()).first()
+        if data_dt ==None:
+            sqlContext.sql('truncate table %s'%incremental_table_name)
+            createAndWriteTable(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date,True)
+    except :
+        createAndWriteTable(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date,True)
+
+def runDailytxn(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date):
+
+    data_dt = sqlContext.table(incremental_table_name).select('data_dt').orderBy(F.col('data_dt').desc()).first().data_dt
+
+    date1 = datetime.strptime(data_dt,'%Y-%m-%d').date()
+    date2 = datetime.strptime(current_date,'%Y-%m-%d').date()
+
+    if date1<date2:
+        date1 = datetime.strptime(datetime.strftime(date1,'%Y-%m-01'),'%Y-%m-%d').date()
+        date2 = datetime.strptime(datetime.strftime(date2,'%Y-%m-01'),'%Y-%m-%d').date()
+
+        if (relativedelta.relativedelta(date2,date1).months<=1):
+            insertTable(q_insert_incremental,incremental_table_name,current_date,True)
+
+        if (relativedelta.relativedelta(date2,date1).months>1):
+            sqlContext.sql("truncate table %s"%incremental_table_name)
+            runOneTimeTxn(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date)
+
+
+def runScheduler(q_create_incremental_table,q_insert_incremental,incremental_table_name,transaction_pool_table_name,folder_name,current_date):
+    if current_date==None:
+        current_date = (datetime.today()- timedelta(days=1)).strftime('%Y-%m-%d')
+
+    q_insert_incremental = createQuery(q_insert_incremental,incremental_table_name,transaction_pool_table_name)
+    runOneTimeTxn(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date)
+    runDailytxn(q_create_incremental_table,q_insert_incremental,incremental_table_name,folder_name,current_date)
+
+runScheduler(q_create_incremental_table,q_insert_incremental,incremental_table_name,transaction_pool_table_name,folder_name,current_date)
+------------------------------------------------------------------------------------------------
+POS--------------
 # coding: utf-8
 
 # In[72]:
