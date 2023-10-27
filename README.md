@@ -1,4 +1,1014 @@
+# coding: utf-8
 
+import pandas as pd
+import pyspark
+from pyspark.context import SparkContext
+from pyspark.sql import SQLContext, HiveContext
+from pyspark.storagelevel import StorageLevel
+from pyspark.sql.functions import udf
+from pyspark.sql.types import *
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+from pyspark.sql.functions import udf
+from pyspark.sql import *
+from pyspark.ml import feature as MF
+from dateutil import relativedelta
+import datetime
+import ConfigParser
+import sys
+
+
+# In[ ]:
+
+sc = SparkContext()
+#sc.setCheckpointDir('/tmp/spark-code-neft')
+
+try:
+    # Try to access HiveConf, it will raise exception if Hive is not added
+    sc._jvm.org.apache.hadoop.hive.conf.HiveConf()
+    sqlContext = HiveContext(sc)
+    sqlContext.setConf("hive.exec.dynamic.partition", "true")
+    sqlContext.setConf("hive.exec.dynamic.partition.mode", "nonstrict")
+except py4j.protocol.Py4JError:
+    sqlContext = SQLContext(sc)
+except TypeError:
+    sqlContext = SQLContext(sc)
+
+
+# In[12]:
+
+configFile = sys.argv[1]
+#configFile = "/data/08/notebooks/tmp/Anisha/Pooling_table/nach_settings.ini"
+config = ConfigParser.ConfigParser()
+config.read(configFile)
+data_dtt = config.get('default', 'MASTER_DATA_DATE_KEY',)
+data_dt = data_dtt.strip('"').strip("'")
+out_tbl = config.get('default', 'OUT_DB_NM') + '.' +  config.get('default','OUT_TBL_NM')
+out_table = sqlContext.table(out_tbl)
+usr_batch_id=config.get('default', 'END_BATCH_ID_11')
+ccy_batch_id=config.get('default', 'END_BATCH_ID_10')
+brn_batch_id=config.get('default', 'END_BATCH_ID_20')
+
+
+category_master_tbl = config.get('default', 'INP_DB_NM_13') + '.' +  config.get('default','INP_TBL_NM_13')
+
+eem_master = config.get('default', 'INP_DB_NM_21') + '.' +  config.get('default','INP_TBL_NM_21')
+eem_mapper = config.get('default', 'INP_DB_NM_22') + '.' +  config.get('default','INP_TBL_NM_22')
+
+# In[1]:
+
+#data_dt='2019-09-12'
+
+
+# In[8]:
+pool="""select
+        Mdm_Cust.source as source,
+        trim(CH_NOBOOK.cod_acct_no) as cod_acct_no,
+        cast(Mdm_Cust.cod_cust as string) as cust_id,
+        Mdm_Cust.mdm_id as mdm_id,
+        coalesce(NEFT_IN.txn_ref_no,NEFT_OUT.txn_ref_no,NEFT_REV_ACK.txn_ref_no,NEFT_RET.txn_ref_no,RTGS.txn_ref_no,
+        rtgs_rev_ret.txn_ref_no,IMPS.txn_ref_no,imps_ref_null.txn_ref_no,EPI.txn_ref_key,EPI_irctc.txn_ref_key,
+        DC.txn_ref_no,SI_DEBIT.txn_ref_no,SI_CREDIT.txn_ref_no,Nach.txn_ref_no,UPI.txn_ref_no,UPI_REV.txn_ref_no,UPI_P2M_POOL.txn_ref_no,iwchq.txn_ref_no,dd_issue.txn_ref_no,
+        owchq.txn_ref_no,ATM.retrieval_ref_no,esb_ecollect.txn_ref_no,Intra_FT.txn_ref_no,CH_NOBOOK.ref_txn_no) as txn_ref_no,
+        CH_NOBOOK.dat_post,
+        CH_NOBOOK.dat_value,
+        CH_NOBOOK.dat_txn as dat_time_txn,
+        CH_NOBOOK.cod_txn_mnemonic,
+        CH_NOBOOK.cod_drcr as d_c,
+        CH_NOBOOK.amt_txn as amount,
+        CH_NOBOOK.txt_txn_desc as nobook_txn_text,
+        coalesce(
+NEFT_IN.base_txn_text,NEFT_OUT.base_txn_text,NEFT_REV_ACK.base_txn_text,NEFT_RET.base_txn_text,RTGS.base_txn_text,rtgs_rev_ret.base_txn_text,
+        IMPS.base_txn_text,imps_ref_null.base_txn_text,SI_DEBIT.base_txn_text,SI_CREDIT.base_txn_text,
+        DC.base_txn_text,EPI.base_txn_text,EPI_irctc.base_txn_text,Nach.base_txn_text,UPI.base_txn_text,UPI_REV.base_txn_text,UPI_P2M_POOL.base_txn_text,
+        dd_issue.base_txn_text,iwchq.base_txn_text,owchq.base_txn_text,esb_ecollect.base_txn_text,Intra_FT.base_txn_text) as base_txn_text,
+        (
+        case
+        when Cat_Mast.mode ='NEFT'
+        then TRIM(CH_NOBOOK.ref_txn_no)
+        WHEN Cat_Mast.mode ='RTGS'
+        then TRIM(CH_NOBOOK.ref_txn_no)
+        WHEN (CH_NOBOOK.txt_txn_desc like 'IMPS/%%' or CH_NOBOOK.txt_txn_desc like '%%/RRN%%'
+       OR CH_NOBOOK.txt_txn_desc like '%%/IMPS/RRN:%%' or CH_NOBOOK.txt_txn_desc LIKE '%%RRN : %%'
+        )
+        THEN (case when length(trim(regexp_extract(CH_NOBOOK.ref_usr_no,'[0-9]+',0)))>12
+        then substr(REGEXP_EXTRACT(CH_NOBOOK.txt_txn_desc,'/RRN:(.*)',1),1,instr(
+        REGEXP_EXTRACT(CH_NOBOOK.txt_txn_desc,'/RRN:(.*)',1),'/')-1)
+        else trim(regexp_extract(CH_NOBOOK.ref_usr_no,'[0-9]+',0))
+        end)
+        WHEN DC.MODE = 'DEBIT CARD'
+        THEN concat(TRIM(CH_NOBOOK.cod_acct_no),trim(CH_NOBOOK.ref_txn_no))
+        WHEN (CH_NOBOOK.TXT_TXN_DESC LIKE 'REV:UPI/%%' OR CH_NOBOOK.TXT_TXN_DESC LIKE 'UPI/%%')
+        THEN TRIM(CH_NOBOOK.ref_usr_no)
+        WHEN EPI.MODE ='EPI'
+        THEN concat(trim(CH_NOBOOK.cod_acct_no),trim(CH_NOBOOK.ref_txn_no))
+        WHEN EPI_irctc.MODE ='EPI'
+        THEN concat(trim(CH_NOBOOK.cod_acct_no),trim(CH_NOBOOK.ref_txn_no))
+        WHEN Cat_Mast.MODE = 'NACH'
+        THEN concat(trim(CH_NOBOOK.cod_acct_no),trim(CH_NOBOOK.ref_chq_no))
+        WHEN Cat_Mast.MODE = 'ACCOUNT TRANSFER'
+        THEN concat(trim(CH_NOBOOK.cod_acct_no),to_date(CH_NOBOOK.dat_txn),CH_NOBOOK.amt_txn)
+        WHEN Cat_Mast.MODE = 'DD'
+        THEN CONCAT(CH_NOBOOK.ref_chq_no,ch_nobook.ref_sys_tr_aud_no,CH_NOBOOK.cod_txn_mnemonic)
+        WHEN iwchq.MODE ='CHEQUE'
+        THEN concat(CH_NOBOOK.ref_chq_no,CH_NOBOOK.COD_ACCT_NO)
+        WHEN owchq.MODE ='CHEQUE'
+        THEN concat(CH_NOBOOK.ref_chq_no,CH_NOBOOK.COD_ACCT_NO)
+        when trim(CH_NOBOOK.ref_usr_no) = trim(esb_ecollect.CREDIT_REQ_REF)
+        then concat(CH_NOBOOK.ref_usr_no,CH_NOBOOK.cod_acct_no)
+        when trim(ch_nobook.ref_txn_no) = trim(Intra_FT.txn_ref_no)
+        then trim(ch_nobook.ref_txn_no)
+        ELSE concat(CH_NOBOOK.cod_txn_mnemonic,trim(CH_NOBOOK.cod_acct_no),TRIM(CH_NOBOOK.ref_chq_no),trim(CH_NOBOOK.ref_txn_no))END) as noobook_key,
+        coalesce(
+        NEFT_IN.txn_ref_key,NEFT_OUT.txn_ref_key,NEFT_REV_ACK.txn_ref_key,NEFT_RET.txn_ref_key,RTGS.txn_ref_key,rtgs_rev_ret.txn_ref_key,IMPS.txn_ref_key,
+        imps_ref_null.txn_ref_key,DC.txn_ref_key,
+        EPI.txn_ref_key,EPI_irctc.txn_ref_key,SI_DEBIT.txn_ref_key,SI_CREDIT.txn_ref_key,Nach.txn_ref_key,UPI.txn_ref_key,UPI_REV.txn_ref_key,UPI_P2M_POOL.txn_ref_key,
+        dd_issue.txn_ref_key,iwchq.txn_ref_key,owchq.txn_ref_key,esb_ecollect.txn_ref_no,Intra_FT.txn_ref_no) as txn_ref_key,
+        Mdm_Cust.i_c,
+        (
+        case WHEN (CH_NOBOOK.cod_drcr = 'D' AND CH_NOBOOK.amt_txn > 0.00)
+        THEN
+        (CASE
+        when NEFT_IN.mode = 'NEFT' THEN NEFT_IN.channel
+        when NEFT_OUT.mode = 'NEFT' THEN NEFT_OUT.channel
+        when NEFT_REV_ACK.mode = 'NEFT' THEN NEFT_REV_ACK.channel
+        when NEFT_RET.mode = 'NEFT' THEN NEFT_RET.channel
+        when RTGS.mode ='RTGS' THEN RTGS.channel
+        when rtgs_rev_ret.mode ='RTGS' THEN rtgs_rev_ret.channel
+        WHEN UPI.mode ='UPI' THEN upi.Channel
+        when UPI_REV.mode='UPI' then UPI_REV.Channel
+        WHEN IMPS.mode ='IMPS' then IMPS.channel
+        WHEN imps_ref_null.mode ='IMPS' then imps_ref_null.channel
+        when trim(ch_nobook.ref_txn_no) = trim(Intra_FT.txn_ref_no)
+        then Intra_FT.channel
+        WHEN SI_DEBIT.mode ='ACCOUNT TRANSFER' then SI_DEBIT.channel
+        WHEN CH_NOBOOK.txt_txn_desc like '%%.TXT%%' THEN 'GEFU'
+        WHEN Usr_Profile.cod_user_id ='POS_USER' THEN 'POS'
+        WHEN Usr_Profile.cod_user_id ='ATM_USER' THEN 'ATM'
+        WHEN Usr_Profile.cod_user_id in ('IB','IBUSER','NETUSER') THEN 'RNB'
+        WHEN Usr_Profile.cod_user_id ='PYMT_USER' THEN 'PAYMENT'
+        WHEN Usr_Profile.cod_user_id in ('SYSTEM','SYSTELLER') THEN 'SYSTEM'
+        WHEN Usr_Profile.cod_user_id = 'BNAUSER' THEN 'BNA MACHINE USER'
+        WHEN CH_NOBOOK.txt_txn_desc like '%%MOBTXN%%' THEN 'MB'
+        WHEN Usr_Profile.cod_user_id ='MOBUSER'  THEN 'MB'
+        WHEN Usr_Profile.cod_user_id ='EXCHUSER' THEN 'EXCHANGE'
+        WHEN (Usr_Profile.cod_user_id rlike '[^0-9]' OR cod_user_id ='BRNEFTUSER') THEN 'BRANCH'
+        WHEN Cat_Mast.channel ='' then 'OTHER'
+        WHEN Cat_Mast.channel <>'' then Cat_Mast.channel
+        ELSE 'OTHER'
+        end)
+        WHEN (CH_NOBOOK.cod_drcr = 'C' or (CH_NOBOOK.cod_drcr = 'D' and CH_NOBOOK.amt_txn < 0.00 ))
+        THEN 'SYSTEM'
+        end)as channel,
+        (case
+        when (trim(CH_NOBOOK.ref_usr_no) = trim(esb_ecollect.CREDIT_REQ_REF) and CH_NOBOOK.cod_drcr = 'C')
+        then 'ESB_ECOLLECT'
+        when (IMPS.channel_code = 'ESB_FT' or RTGS.channel_code ='ESB_FT' or NEFT_OUT.channel_code ='ESB_FT'
+        or trim(ch_nobook.ref_txn_no) = trim(Intra_FT.txn_ref_no))
+        then 'ESB_FT'
+        when (IMPS.channel_code = 'ESB_INW_REMIT' or RTGS.channel_code ='ESB_INW_REMIT' or NEFT_OUT.channel_code ='ESB_INW_REMIT'
+             or UPI.channel_code = 'ESB_INW_REMIT')
+        then 'ESB_INW_REMIT'
+        end) as channel_code,
+        'NULL' as channel_class,
+        (case
+        WHEN ((IMPS.MODE = 'IMPS' or CH_NOBOOK.txt_txn_desc like 'IMPS/%%' or CH_NOBOOK.txt_txn_desc like '%%/RRN%%'
+        or CH_NOBOOK.txt_txn_desc like '%%/IMPS/RRN:%%'
+    or CH_NOBOOK.txt_txn_desc LIKE '%%RRN : %%') and (CH_NOBOOK.txt_txn_desc NOT LIKE '%%BNA CASH DEPOSIT%%'
+    AND CH_NOBOOK.txt_txn_desc NOT LIKE '%%CASH DEPOSITYBL BNA RRN%%') )
+        THEN 'IMPS'
+        WHEN (UPI.MODE = 'UPI' or UPI_REV.mode='UPI' or UPI_P2M_POOL.mode = 'UPI' or CH_NOBOOK.TXT_TXN_DESC LIKE 'REV:UPI/%%' OR CH_NOBOOK.TXT_TXN_DESC LIKE 'UPI/%%')
+        THEN 'UPI'
+    when (trim(CH_NOBOOK.ref_usr_no) = trim(esb_ecollect.CREDIT_REQ_REF) and CH_NOBOOK.cod_drcr = 'C')
+    then (case when esb_ecollect.mode ='FT' then 'ACCOUNT TRANSFER' else esb_ecollect.mode end)
+    when trim(ch_nobook.ref_txn_no) = trim(Intra_FT.txn_ref_no)
+    then Intra_FT.mode
+        ELSE coalesce(NEFT_IN.MODE,NEFT_OUT.MODE,NEFT_REV_ACK.MODE,NEFT_RET.MODE,RTGS.MODE,rtgs_rev_ret.mode,EPI.MODE,EPI_irctc.MODE,
+                    DC.MODE,Nach.MODE,SI_DEBIT.MODE,SI_CREDIT.MODE,dd_issue.MODE,iwchq.MODE,owchq.MODE,
+                        (case when Cat_Mast.mode IS NULL then 'OTHER'
+                        ELSE Cat_Mast.mode end), 'OTHER')
+        END
+        ) as mode,
+       coalesce
+(NEFT_IN.remitter_id,NEFT_OUT.remitter_id,RTGS.remitter_id,rtgs_rev_ret.remitter_id,IMPS.remitter_id,imps_ref_null.remitter_id,SI_DEBIT.remitter_id,SI_CREDIT.remitter_id,EPI.remitter_id,EPI_irctc.remitter_id,DC.remitter_id,Nach.remitter_id,
+        UPI.remitter_id,UPI_REV.remitter_id,UPI_P2M_POOL.remitter_id,dd_issue.remitter_id,iwchq.remitter_id,owchq.remitter_id,esb_ecollect.remitter_id,Intra_FT.remitter_id) as remitter_id,
+        coalesce(NEFT_IN.remitter_name,NEFT_OUT.remitter_name,NEFT_REV_ACK.remitter_name,NEFT_RET.remitter_name,
+        RTGS.remitter_name,rtgs_rev_ret.remitter_name,
+        IMPS.remitter_name,imps_ref_null.remitter_name,SI_DEBIT.remitter_name,SI_CREDIT.remitter_name,DC.remitter_name,EPI.remitter_name,EPI_irctc.remitter_name,Nach.remitter_name,
+        UPI.remitter_name,UPI_REV.remitter_name,UPI_P2M_POOL.remitter_name,dd_issue.remitter_name,iwchq.remitter_name,owchq.remitter_name,esb_ecollect.remitter_name,Intra_FT.remitter_name,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'D')
+        then Mdm_Cust.cod_acct_title end),
+        (case
+        when (CH_NOBOOK.cod_txn_mnemonic ='2157' and CH_NOBOOK.ref_usr_no is NULL)
+        then Mdm_Cust.cod_acct_title end)
+        ) as remitter_name,
+        coalesce
+(NEFT_IN.remitter_type,NEFT_OUT.remitter_type,RTGS.remitter_type,rtgs_rev_ret.remitter_type,IMPS.remitter_type,imps_ref_null.remitter_type,
+    SI_DEBIT.remitter_type,SI_CREDIT.remitter_type,DC.remitter_type,EPI.remitter_type,EPI_irctc.remitter_type,
+       Nach.remitter_type,UPI.remitter_type,UPI_REV.remitter_type,UPI_P2M_POOL.remitter_type,dd_issue.remitter_type,iwchq.remitter_type,owchq.remitter_type,esb_ecollect.remitter_type
+        ) as remitter_type,
+        coalesce(NEFT_IN.remitter_class,NEFT_OUT.remitter_class,RTGS.remitter_class,rtgs_rev_ret.remitter_class,IMPS.remitter_class,imps_ref_null.remitter_class,
+        SI_DEBIT.remitter_class,SI_CREDIT.remitter_class,
+    DC.remitter_class,EPI.remitter_class,EPI_irctc.remitter_class,Nach.remitter_class,UPI.remitter_class,UPI_REV.remitter_class,UPI_P2M_POOL.remitter_class,dd_issue.remitter_class,iwchq.remitter_class,owchq.remitter_class,
+    esb_ecollect.remitter_class) as remitter_class,
+       coalesce
+(NEFT_IN.remitter_sub_class,NEFT_OUT.remitter_sub_class,RTGS.remitter_sub_class,rtgs_rev_ret.remitter_sub_class,IMPS.remitter_sub_class,imps_ref_null.remitter_sub_class,SI_DEBIT.remitter_sub_class,DC.remitter_sub_class,
+EPI.remitter_sub_class,EPI_irctc.remitter_sub_class,Nach.remitter_sub_class,UPI.remitter_sub_class,UPI_REV.remitter_sub_class,UPI_P2M_POOL.remitter_sub_class,dd_issue.remitter_sub_class,iwchq.remitter_sub_class,
+owchq.remitter_sub_class,esb_ecollect.remitter_sub_class) as remitter_sub_class,
+        coalesce(NEFT_IN.remitter_ifsc,NEFT_OUT.remitter_ifsc,NEFT_REV_ACK.remitter_ifsc,NEFT_RET.remitter_ifsc,
+        RTGS.remitter_ifsc,rtgs_rev_ret.remitter_ifsc,IMPS.remitter_ifsc,imps_ref_null.remitter_ifsc,SI_DEBIT.remitter_ifsc,SI_CREDIT.remitter_ifsc,DC.remitter_ifsc,EPI.remitter_ifsc,EPI_irctc.remitter_ifsc,
+        Nach.remitter_ifsc,UPI.remitter_ifsc,UPI_REV.remitter_ifsc,UPI_P2M_POOL.remitter_ifsc,dd_issue.remitter_ifsc,iwchq.remitter_ifsc,
+        owchq.remitter_ifsc,esb_ecollect.remitter_ifsc,Intra_FT.remitter_ifsc,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'D')
+        then Mdm_Cust.ifsc_code end),
+        (case
+        when (CH_NOBOOK.cod_txn_mnemonic ='2157' and CH_NOBOOK.ref_usr_no is NULL)
+        then Mdm_Cust.ifsc_code end)
+        ) as remitter_ifsc,
+        coalesce
+(NEFT_IN.remitter_bank_name,NEFT_OUT.remitter_bank_name,NEFT_REV_ACK.remitter_bank_name,NEFT_RET.remitter_bank_name,
+        RTGS.remitter_bank_name,rtgs_rev_ret.remitter_bank_name,IMPS.remitter_bank_name,imps_ref_null.remitter_bank_name,
+        SI_DEBIT.remitter_bank_name,SI_CREDIT.remitter_bank_name
+        ,DC.remitter_bank_name,EPI.remitter_bank_name,EPI_irctc.remitter_bank_name,Nach.remitter_bank_name,UPI.remitter_bank_name,
+       UPI_REV.remitter_bank_name,UPI_P2M_POOL.remitter_bank_name,dd_issue.remitter_bank_name,iwchq.remitter_bank_name,owchq.remitter_bank_name,esb_ecollect.remitter_bank_name,Intra_FT.remitter_bank_name,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'D')
+        then Mdm_Cust.Bank_Name end),
+        (case
+        when (CH_NOBOOK.cod_txn_mnemonic ='2157' and CH_NOBOOK.ref_usr_no is NULL)
+        then Mdm_Cust.Bank_Name end)) as remitter_bank_name,
+        coalesce
+(NEFT_IN.remitter_account_no,NEFT_OUT.remitter_account_no,NEFT_REV_ACK.remitter_account_no,NEFT_RET.remitter_account_no,
+        RTGS.remitter_account_no,rtgs_rev_ret.remitter_account_no,IMPS.remitter_account_no,imps_ref_null.remitter_account_no,SI_DEBIT.remitter_account_no,SI_CREDIT.remitter_account_no
+        ,EPI.remitter_account_no,EPI_irctc.remitter_account_no,DC.remitter_account_no,Nach.remitter_account_no,
+        UPI.remitter_account_no,UPI_REV.remitter_account_no,UPI_P2M_POOL.remitter_account_no,dd_issue.remitter_account_no,iwchq.remitter_account_no,owchq.remitter_account_no,esb_ecollect.remitter_account_no,Intra_FT.remitter_account_no,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'D')
+        then Mdm_Cust.cod_acct_no end),
+        (case
+        when (CH_NOBOOK.cod_txn_mnemonic ='2157' and CH_NOBOOK.ref_usr_no is NULL)
+        then Mdm_Cust.cod_acct_no end)
+        ) as remitter_account_no,
+        coalesce(NEFT_OUT.remitter_cust_id,NEFT_REV_ACK.remitter_cust_id,RTGS.remitter_cust_id,rtgs_rev_ret.remitter_cust_id,
+        IMPS.remitter_cust_id,imps_ref_null.remitter_cust_id,EPI.remitter_cust_id,EPI_irctc.remitter_cust_id,DC.remitter_cust_id,
+        SI_DEBIT.remitter_cust_id,SI_CREDIT.remitter_cust_id,
+        Nach.remitter_cust_id,UPI.remitter_cust_id,UPI_REV.remitter_cust_id,UPI_P2M_POOL.remitter_cust_id,dd_issue.remitter_cust_id,
+        iwchq.remitter_cust_id,owchq.remitter_cust_id,esb_ecollect.remitter_cust_id,Intra_FT.remitter_cust_id,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'D')
+        then Mdm_Cust.cod_cust end),
+        (case
+        when (CH_NOBOOK.cod_txn_mnemonic ='2157' and CH_NOBOOK.ref_usr_no is NULL)
+        then Mdm_Cust.cod_cust end)
+        ) as remitter_cust_id,
+        coalesce(NEFT_IN.benef_id,NEFT_RET.benef_id,RTGS.benef_id,rtgs_rev_ret.benef_id
+        ,IMPS.benef_id,imps_ref_null.benef_id,SI_DEBIT.benef_id,EPI.benef_id,EPI_irctc.benef_id,DC.benef_id,Nach.benef_id,UPI.benef_id,UPI_REV.benef_id,
+        UPI_P2M_POOL.benef_id,dd_issue.benef_id,iwchq.benef_id,owchq.benef_id,esb_ecollect.benef_id,Intra_FT.benef_id
+        )as benef_id,
+        coalesce(NEFT_IN.benef_name,NEFT_OUT.benef_name,NEFT_REV_ACK.benef_name,NEFT_RET.benef_name,
+        RTGS.benef_name,rtgs_rev_ret.benef_name,IMPS.benef_name,imps_ref_null.benef_name
+        ,SI_DEBIT.benef_name,SI_CREDIT.benef_name,EPI.benef_name,DC.benef_name,Nach.benef_name,UPI.benef_name,UPI_REV.benef_name,UPI_P2M_POOL.benef_name,
+        dd_issue.benef_name,iwchq.benef_name,owchq.benef_name,esb_ecollect.benef_name,Intra_FT.bene_name,
+        (case
+        when Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'C'
+        then Mdm_Cust.cod_acct_title end)
+        )as benef_name,
+        coalesce(NEFT_IN.benef_type,NEFT_OUT.benef_type,RTGS.benef_type,rtgs_rev_ret.benef_type
+        ,IMPS.benef_type,imps_ref_null.benef_type,SI_DEBIT.benef_type,SI_CREDIT.benef_type,DC.benef_type,EPI.benef_type,EPI_irctc.benef_type,Nach.benef_type,UPI.benef_type,UPI_REV.benef_type,
+        UPI_P2M_POOL.benef_type,dd_issue.benef_type,iwchq.benef_type,owchq.benef_type,esb_ecollect.benef_type) as benef_type,
+        coalesce(NEFT_IN.benef_class,NEFT_OUT.benef_class,RTGS.benef_class,rtgs_rev_ret.benef_class,IMPS.benef_class,imps_ref_null.benef_class,
+        SI_DEBIT.benef_class,SI_CREDIT.benef_class,DC.benef_class,EPI.benef_class,EPI_irctc.benef_class,Nach.benef_class,UPI.benef_class,UPI_REV.benef_class,
+        UPI_P2M_POOL.benef_class,dd_issue.benef_class,iwchq.benef_class,owchq.benef_class,esb_ecollect.benef_class) as benef_class,
+        coalesce(NEFT_IN.benef_sub_class,NEFT_OUT.benef_sub_class,RTGS.benef_sub_class,rtgs_rev_ret.benef_sub_class,IMPS.benef_sub_class,imps_ref_null.benef_sub_class,
+        SI_DEBIT.benef_sub_class,SI_CREDIT.benef_sub_class,DC.benef_sub_class,EPI.benef_sub_class,EPI_irctc.benef_sub_class,Nach.benef_sub_class,UPI.benef_sub_class,UPI_REV.benef_sub_class,
+        UPI_P2M_POOL.benef_sub_class,dd_issue.benef_sub_class,iwchq.benef_sub_class,owchq.benef_sub_class,esb_ecollect.benef_sub_class) as benef_sub_class,
+        coalesce(NEFT_IN.benef_ifsc,NEFT_OUT.benef_ifsc,NEFT_REV_ACK.benef_ifsc,NEFT_RET.benef_ifsc,
+        RTGS.benef_ifsc,rtgs_rev_ret.benef_ifsc,IMPS.benef_ifsc,imps_ref_null.benef_ifsc
+        ,SI_DEBIT.benef_ifsc,SI_CREDIT.benef_ifsc,EPI.benef_ifsc,EPI_irctc.benef_ifsc,DC.benef_ifsc,Nach.benef_ifsc,UPI.benef_ifsc,UPI_REV.benef_ifsc,
+        UPI_P2M_POOL.benef_ifsc,dd_issue.benef_ifsc,iwchq.benef_ifsc,owchq.benef_ifsc,esb_ecollect.benef_ifsc,Intra_FT.benef_ifsc,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'C')
+        then Mdm_Cust.ifsc_code end)
+        ) as benef_ifsc,
+        coalesce(NEFT_IN.benef_bank_name,NEFT_OUT.benef_bank_name,NEFT_REV_ACK.benef_bank_name,NEFT_RET.benef_bank_name
+        ,RTGS.benef_bank_name,rtgs_rev_ret.benef_bank_name,IMPS.benef_bank_name,imps_ref_null.benef_bank_name,SI_DEBIT.benef_bank_name,SI_CREDIT.benef_bank_name
+        ,EPI.benef_bank_name,EPI_irctc.benef_bank_name,DC.benef_bank_name,Nach.benef_bank_name,UPI.benef_bank_name,UPI_REV.benef_bank_name,
+        UPI_P2M_POOL.benef_bank_name,dd_issue.benef_bank_name,iwchq.benef_bank_name,owchq.benef_bank_name,esb_ecollect.benef_bank_name,Intra_FT.bene_bank_name,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'C')
+        then Mdm_Cust.Bank_Name end)
+        ) as benef_bank_name,
+        coalesce(NEFT_IN.benef_account_no,NEFT_OUT.benef_account_no,NEFT_REV_ACK.benef_account_no,NEFT_RET.benef_account_no
+        ,RTGS.benef_account_no,rtgs_rev_ret.benef_account_no,IMPS.benef_account_no,imps_ref_null.benef_account_no
+        ,SI_DEBIT.benef_account_no,SI_CREDIT.benef_account_no,EPI.benef_account_no,EPI_irctc.benef_account_no,DC.benef_account_no,
+        Nach.benef_account_no,UPI.benef_account_no,UPI_REV.benef_account_no,UPI_P2M_POOL.benef_account_no,dd_issue.benef_account_no,iwchq.benef_account_no,owchq.benef_account_no,esb_ecollect.benef_account_no,Intra_FT.bene_account_no,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'C')
+        then Mdm_Cust.cod_acct_no end)
+        ) as benef_account_no,
+        coalesce(NEFT_IN.benef_cust_id,NEFT_RET.benef_cust_id,RTGS.benef_cust_id,rtgs_rev_ret.benef_cust_id,IMPS.benef_cust_id,imps_ref_null.benef_cust_id
+        ,SI_DEBIT.benef_cust_id,SI_CREDIT.benef_cust_id,EPI.benef_cust_id,EPI_irctc.benef_cust_id,DC.benef_cust_id,Nach.benef_cust_id,
+        UPI.benef_cust_id,UPI_REV.benef_cust_id,UPI_P2M_POOL.benef_cust_id,dd_issue.benef_cust_id,iwchq.benef_cust_id,owchq.benef_cust_id,esb_ecollect.benef_cust_id,Intra_FT.bene_cust_id,
+        (case
+        when (Cat_Mast.class_type = 'Direct' and CH_NOBOOK.cod_drcr = 'C')
+        then Mdm_Cust.cod_cust end)
+        ) as benef_cust_id,
+        coalesce(NEFT_IN.online_offline,NEFT_OUT.online_offline,RTGS.online_offline,rtgs_rev_ret.online_offline,IMPS.online_offline,imps_ref_null.online_offline
+        ,SI_DEBIT.online_offline,SI_CREDIT.online_offline,EPI.online_offline,EPI_irctc.online_offline,DC.online_offline,Nach.online_offline,
+        UPI.online_offline,UPI_REV.online_offline,UPI_P2M_POOL.online_offline,dd_issue.online_offline,iwchq.online_offline,owchq.online_offline,esb_ecollect.online_offline) as online_offline,
+        Curr_Mast.NAM_CCY_SHORT as currency,
+        coalesce(NEFT_IN.category_level1,NEFT_OUT.category_level1,NEFT_REV_ACK.category_level1,
+        NEFT_RET.category_level1,RTGS.category_level1,rtgs_rev_ret.category_level1,IMPS.category_level1,imps_ref_null.category_level1,
+        SI_DEBIT.category_level1,SI_CREDIT.category_level1,DC.category_level1,
+       EPI.category_level1,EPI_irctc.category_level1,Nach.category_level1,UPI.category_level1,UPI_REV.category_level1,UPI_P2M_POOL.category_level1,dd_issue.category_level1,iwchq.category_level1,
+        Cat_Mast.category_level1) as category_level1,
+        coalesce
+(NEFT_IN.category_level2,NEFT_OUT.category_level2,NEFT_REV_ACK.category_level2,NEFT_RET.category_level2,RTGS.category_level2,rtgs_rev_ret.category_level2,
+IMPS.category_level2,imps_ref_null.category_level2,SI_DEBIT.category_level2,SI_CREDIT.category_level2,DC.category_level2,EPI_irctc.category_level2,EPI.category_level2,Nach.category_level2,UPI.category_level2,
+UPI_REV.category_level2,UPI_P2M_POOL.category_level2,dd_issue.category_level2,iwchq.category_level2,Cat_Mast.category_level2
+        ) as category_level2,
+        coalesce
+(NEFT_IN.category_level3,NEFT_OUT.category_level3,NEFT_REV_ACK.category_level3,NEFT_RET.category_level3,
+RTGS.category_level3,rtgs_rev_ret.category_level3,IMPS.category_level3,imps_ref_null.category_level3,SI_DEBIT.category_level3,
+SI_CREDIT.category_level3,DC.category_level3,EPI.category_level3,EPI_irctc.category_level3,Nach.category_level3,
+        UPI.category_level3,UPI_REV.category_level3,UPI_P2M_POOL.category_level3,dd_issue.category_level3,iwchq.category_level3,Cat_Mast.category_level3
+        ) as category_level3,
+        coalesce(NEFT_IN.category_code,NEFT_OUT.category_code,NEFT_REV_ACK.category_code,NEFT_RET.category_code
+        ,RTGS.category_code,rtgs_rev_ret.category_code,IMPS.category_code,imps_ref_null.category_code,
+       SI_DEBIT.category_code,SI_CREDIT.category_code,DC.category_code,
+        EPI.category_code,EPI_irctc.category_code,Nach.category_code,UPI.category_code,UPI_REV.category_code,UPI_P2M_POOL.category_code,dd_issue.category_code,iwchq.category_code,Cat_Mast.category_code
+        ) as category_code,
+        coalesce(NEFT_IN.recurrance_flag,NEFT_OUT.recurrance_flag,NEFT_REV_ACK.recurrance_flag,NEFT_RET.recurrance_flag
+        ,RTGS.recurrance_flag,rtgs_rev_ret.recurrance_flag,IMPS.recurrance_flag,imps_ref_null.recurrance_flag,
+        SI_DEBIT.recurrance_flag,SI_CREDIT.recurrance_flag,DC.recurrance_flag,EPI.recurrance_flag,EPI_irctc.recurrance_flag,
+        Nach.recurrance_flag,UPI.recurrance_flag,UPI_REV.recurrance_flag,UPI_P2M_POOL.recurrance_flag,dd_issue.recurrance_flag,iwchq.recurrance_flag,esb_ecollect.recurrance_flag) as recurrance_flag,
+        coalesce
+(NEFT_IN.recurrance_pattern_id,NEFT_OUT.recurrance_pattern_id,RTGS.recurrance_pattern_id,rtgs_rev_ret.recurrance_pattern_id,
+IMPS.recurrance_pattern_id,imps_ref_null.recurrance_pattern_id,
+SI_DEBIT.recurrance_pattern_id,SI_CREDIT.recurrance_pattern_id,DC.recurrance_pattern_id,EPI.recurrance_pattern_id,EPI_irctc.recurrance_pattern_id,Nach.recurrance_pattern_id,UPI.recurrance_pattern_id,
+UPI_REV.recurrance_pattern_id,UPI_P2M_POOL.recurrance_pattern_id,dd_issue.recurrance_pattern_id,iwchq.recurrance_pattern_id,owchq.recurrance_pattern_id,esb_ecollect.recurrance_pattern_id) as recurrance_pattern_id,
+        coalesce
+(NEFT_IN.verification_flag,NEFT_OUT.verification_flag,RTGS.verification_flag,rtgs_rev_ret.verification_flag,IMPS.verification_flag,imps_ref_null.verification_flag,
+SI_DEBIT.verification_flag,SI_CREDIT.verification_flag,
+DC.verification_flag,EPI.verification_flag,EPI_irctc.verification_flag,Nach.verification_flag,UPI.verification_flag,UPI_REV.verification_flag,UPI_P2M_POOL.verification_flag
+,dd_issue.verification_flag,iwchq.verification_flag,owchq.verification_flag,esb_ecollect.verification_flag) as verification_flag,
+        coalesce
+(NEFT_IN.self_flag,NEFT_OUT.self_flag,RTGS.self_flag,rtgs_rev_ret.self_flag,IMPS.self_flag,imps_ref_null.self_flag,
+        SI_DEBIT.self_flag,SI_CREDIT.self_flag,DC.self_flag,EPI.self_flag,EPI_irctc.self_flag,
+        Nach.self_flag,UPI.self_flag,UPI_REV.self_flag,UPI_P2M_POOL.self_flag,dd_issue.self_flag,iwchq.self_flag,owchq.self_flag,esb_ecollect.self_flag) as self_flag,
+        CH_NOBOOK.COD_USERNO,CH_NOBOOK.ref_sys_tr_aud_no,
+        CH_NOBOOK.ctr_batch_no,
+        CH_NOBOOK.cod_proc,
+        CH_NOBOOK.ref_card_no,
+        CH_NOBOOK.ref_usr_no,
+        'NULL' as transaction_category,
+        'NULL' as mcc_category,
+        'NULL' as mcc_desc,
+        DC.cod_merch_typ as mt_category_code,
+        coalesce(IMPS.benef_nickname,NEFT_IN.benef_nickname,NEFT_OUT.benef_nickname,
+        NEFT_REV_ACK.benef_nickname,NEFT_RET.benef_nickname,RTGS.benef_nickname) as benef_nickname,
+        CH_NOBOOK.unique_ref_no,
+        'NULL' as transaction_sub_cat,
+        'NULL' as transaction_net_cat,
+        cast(CH_NOBOOK.amt_txn_tcy as string) as amt_txn_tcy,
+        cast(CH_NOBOOK.ref_sub_seq_no as string) as ref_sub_seq_no,
+        CH_NOBOOK.cod_cc_brn_txn,
+        CH_NOBOOK.cod_txn_literal,
+        ATM.ca_term_id,
+        '%s' as DATA_DT,
+        (case
+        WHEN ((IMPS.MODE = 'IMPS' or CH_NOBOOK.txt_txn_desc like 'IMPS/%%' or CH_NOBOOK.txt_txn_desc like '%%/RRN%%'
+        or CH_NOBOOK.txt_txn_desc like '%%/IMPS/RRN:%%'
+    or CH_NOBOOK.txt_txn_desc LIKE '%%RRN : %%') and (CH_NOBOOK.txt_txn_desc NOT LIKE '%%BNA CASH DEPOSIT%%'
+    AND CH_NOBOOK.txt_txn_desc NOT LIKE '%%CASH DEPOSITYBL BNA RRN%%') )
+        THEN 'IMPS'
+        WHEN (UPI.MODE = 'UPI' or UPI_REV.mode='UPI' or UPI_P2M_POOL.mode = 'UPI' or CH_NOBOOK.TXT_TXN_DESC LIKE 'REV:UPI/%%' OR CH_NOBOOK.TXT_TXN_DESC LIKE 'UPI/%%')
+        THEN 'UPI'
+    when (trim(CH_NOBOOK.ref_usr_no) = trim(esb_ecollect.CREDIT_REQ_REF) and CH_NOBOOK.cod_drcr = 'C')
+    then (case when esb_ecollect.mode ='FT' then 'ACCOUNT TRANSFER' else esb_ecollect.mode end)
+    when trim(ch_nobook.ref_txn_no) = trim(Intra_FT.txn_ref_no)
+    then Intra_FT.mode
+        ELSE coalesce(NEFT_IN.MODE,NEFT_OUT.MODE,NEFT_REV_ACK.MODE,NEFT_RET.MODE,RTGS.MODE,rtgs_rev_ret.mode,EPI.MODE,EPI_irctc.MODE,
+                    DC.MODE,Nach.MODE,SI_DEBIT.MODE,SI_CREDIT.MODE,dd_issue.MODE,iwchq.MODE,owchq.MODE,
+                        (case when Cat_Mast.mode IS NULL then 'OTHER'
+                        ELSE Cat_Mast.mode end), 'OTHER')
+        END
+        ) as partition_mode
+
+
+       FROM
+        (select * from db_gold.GLD_LIAB_TRANSACTION a
+        where a.year='%s'
+    and a.month ='%s'
+    and a.`date` ='%s'
+    )CH_NOBOOK
+
+
+        LEFT OUTER JOIN
+        (SELECT /*+MAPJOIN(a) */ a.COD_CCY,a.NAM_CCY_SHORT FROM db_stage.STG_FCR_FCRLIVE_1_BA_CCY_CODE a
+       where a.batch_id ='%s')Curr_Mast
+       ON
+        cast(CH_NOBOOK.cod_txn_ccy  as string)= Curr_Mast.COD_CCY
+
+
+       LEFT OUTER JOIN
+        (select /*+MAPJOIN(a) */ a.* FROM db_stage.STG_FCR_FCRLIVE_1_SM_USER_PROFILE a
+         where a.batch_id= '%s') Usr_Profile
+       ON
+        cast(Usr_Profile.COD_USERNO as int) = CH_NOBOOK.COD_USERNO
+
+
+       LEFT OUTER JOIN
+        (
+       select /*+MAPJOIN(tmp1) */ * from
+       (select
+       b.category_code,b.category_level1,b.category_level2,b.category_level3,
+       a.cod_txn_mnemonic,a.class_type,a.mode,a.channel
+       from
+       db_stage.stg_fle_txn_mnemonics_master a
+       left outer join
+       db_stage.stg_fle_category_master b
+       on TRIM(a.category_code) = TRIM(b.category_code)
+       ) tmp1)Cat_Mast
+       ON
+        cast(CH_NOBOOK.COD_TXN_MNEMONIC as string) = trim(Cat_Mast.COD_TXN_MNEMONIC)
+
+
+LEFT OUTER JOIN
+    (
+    select
+    a.cod_cust,a.cod_acct_no,a.cod_acct_title,a.cod_cc_brn,
+    a.i_c,a.source,a.mdm_id,b.cod_fin_inst_id as ifsc_code,'YES BANK LTD' as Bank_Name
+from
+(SELECT
+cod_cust,cod_acct_no,cod_acct_title,cod_cc_brn,i_c,source,mdm_id
+FROM db_gold.GLD_MDM_CUST_POOL a
+where a.data_dt ='%s')a
+        left outer join
+(select /*+MAPJOIN(a) */ a.cod_cc_brn,a.cod_fin_inst_id
+        from db_stage.stg_fcr_fcrlive_1_ba_cc_brn_mast a
+        where a.batch_id ='%s'
+)b
+on a.cod_cc_brn = b.cod_cc_brn
+)Mdm_Cust
+       ON
+        trim(CH_NOBOOK.cod_acct_no)=TRIM(Mdm_Cust.cod_acct_no)
+
+LEFT OUTER JOIN
+        (SELECT a.* FROM db_smith.SMTH_POOL_SI a
+        where a.data_dt in (select max(data_dt) from db_smith.SMTH_POOL_SI)
+        and cod_si_type <> '10'
+        AND flg_mnt_status = 'A'
+             )SI_DEBIT
+       ON
+        (case when CH_NOBOOK.cod_txn_mnemonic = 9990
+                then TRIM(CH_NOBOOK.cod_acct_no) ELSE CH_NOBOOK.DAT_TXN END) = TRIM(SI_DEBIT.remitter_account_no)
+        AND CH_NOBOOK.AMT_TXN = CAST(SI_DEBIT.txn_amt AS DECIMAL(18,2))
+        and substr(TRIM(CH_NOBOOK.txt_txn_desc),1,15) = TRIM(SI_DEBIT.benef_account_no)
+        AND CH_NOBOOK.cod_txn_mnemonic = 9990
+        and (case when CH_NOBOOK.txt_txn_desc like '%% RD %%'
+            then upper(substr(trim(CH_NOBOOK.txt_txn_desc),-15))
+            when CH_NOBOOK.txt_txn_desc like '%%NET TXN:%%'
+            then upper(trim(substr(CH_NOBOOK.txt_txn_desc,26,7)))
+            else upper(substr(trim(CH_NOBOOK.txt_txn_desc),-10))
+            end) = (case when SI_DEBIT.base_txn_text like '%% RD %%'
+            then upper(substr(trim(SI_DEBIT.base_txn_text),-15))
+            when SI_DEBIT.base_txn_text like '%%NET TXN:%%'
+            then upper(trim(substr(SI_DEBIT.base_txn_text,1,7)))
+           else upper(substr(trim(SI_DEBIT.base_txn_text),-10))
+            end)
+
+
+LEFT OUTER join
+        (SELECT a.* FROM db_smith.SMTH_POOL_SI a
+        where a.data_dt in (select max(data_dt) from db_smith.SMTH_POOL_SI)
+        and cod_si_type <> '10'
+        AND flg_mnt_status = 'A'
+        )SI_CREDIT
+ON
+        (CASE WHEN CH_NOBOOK.cod_txn_mnemonic = 9991 THEN TRIM(CH_NOBOOK.cod_acct_no)
+                ELSE CH_NOBOOK.DAT_TXN  END ) = TRIM(SI_CREDIT.benef_account_no)
+        AND CH_NOBOOK.AMT_TXN = CAST(SI_CREDIT.txn_amt AS DECIMAL(18,2))
+        and substr(TRIM(CH_NOBOOK.txt_txn_desc),1,15) = TRIM(SI_CREDIT.remitter_account_no)
+        AND CH_NOBOOK.cod_txn_mnemonic = 9991
+        and (case when CH_NOBOOK.txt_txn_desc like '%% RD %%'
+            then upper(substr(trim(CH_NOBOOK.txt_txn_desc),-15))
+            when CH_NOBOOK.txt_txn_desc like '%%NET TXN:%%'
+            then upper(trim(substr(CH_NOBOOK.txt_txn_desc,26,7)))
+            else upper(substr(trim(CH_NOBOOK.txt_txn_desc),-10))
+            end) = (case when SI_CREDIT.base_txn_text like '%% RD %%'
+            then upper(substr(trim(SI_CREDIT.base_txn_text),-15))
+            when SI_CREDIT.base_txn_text like '%%NET TXN:%%'
+            then upper(trim(substr(SI_CREDIT.base_txn_text,1,7)))
+            else upper(substr(trim(SI_CREDIT.base_txn_text),-10))
+            end)
+
+left outer join
+      (SELECT * FROM db_smith.SMTH_POOL_DDISSUE where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2)) dd_issue
+      on
+       TRIM(CH_NOBOOK.cod_acct_no)=TRIM(dd_issue.remitter_account_no)
+        and CH_NOBOOK.ref_sys_tr_aud_no = cast(dd_issue.ref_sys_tr_aud_no as int)
+        and CH_NOBOOK.cod_txn_mnemonic = cast(dd_issue.cod_txn_mnemonic as int)
+        and to_date(CH_NOBOOK.dat_post) = to_date(dd_issue.data_dt)
+        and CH_NOBOOK.amt_txn =  cast(dd_issue.txn_amt as double)
+        and CH_NOBOOK.cod_userno = cast(dd_issue.cod_userno as int)
+
+left outer join
+        (SELECT * FROM db_smith.SMTH_POOL_NACH WHERE (data_dt) >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+        and (mandate_reject_date is null and mandate_reject_code is null)
+        ) Nach
+         on
+         (case
+        when (CH_NOBOOK.txt_txn_desc not LIKE 'ECS%%' and CH_NOBOOK.txt_txn_desc not like 'MAXLIFE%%')
+        then
+        (case
+        when (TRIM(CH_NOBOOK.ref_chq_no) is null or TRIM(CH_NOBOOK.ref_chq_no) = '' or trim(CH_NOBOOK.ref_chq_no)='000000000000')
+       then CH_NOBOOK.dat_txn else TRIM(CH_NOBOOK.ref_chq_no) end)
+       else CH_NOBOOK.dat_txn end) = trim(Nach.TXN_REF_NO)
+       and CH_NOBOOK.amt_txn =  cast(nach.txn_amt as decimal(18,2))
+       AND CH_NOBOOK.cod_txn_mnemonic IN(9835,9836,9844,9845,4913)
+
+LEFT OUTER JOIN
+        (select * from db_smith.SMTH_POOL_EPI where
+        data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2))EPI_irctc
+       on
+        (case when TRIM(CH_NOBOOK.ref_txn_no) is null or TRIM(CH_NOBOOK.ref_txn_no) = ''
+       then CH_NOBOOK.dat_txn else TRIM(CH_NOBOOK.ref_txn_no) end) = trim(EPI_irctc.txn_ref_key)
+           AND TO_DATE(CH_NOBOOK.DAT_TXN) = TO_DATE(EPI_irctc.DATA_DT)
+    and trim(regexp_extract(CH_NOBOOK.txt_txn_desc,'[0-9]+',0)) = trim(regexp_extract(EPI_irctc.mercrefno,'[0-9]+',0))
+    and CH_NOBOOK.cod_txn_mnemonic in (6922,6923)
+
+LEFT OUTER JOIN
+        (select * from db_smith.SMTH_POOL_EPI where
+    data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2)
+    )EPI
+    on
+    (case when (TRIM(CH_NOBOOK.ref_txn_no) is null or TRIM(CH_NOBOOK.ref_txn_no) = '')
+       then CH_NOBOOK.dat_txn else TRIM(CH_NOBOOK.ref_txn_no) end) = trim(EPI.txn_ref_key)
+    and substr(cast(CH_NOBOOK.dat_txn as string),1,13) = substr(EPI.txn_date,1,13)
+    and ch_nobook.amt_txn = cast(EPI.txn_amt as decimal(18,2))
+    AND CH_NOBOOK.cod_txn_mnemonic in (6919,6921)
+
+LEFT OUTER JOIN
+        (select a.* from db_smith.SMTH_POOL_RTGS a
+        where a.data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+        )RTGS
+        ON
+        trim(CH_NOBOOK.ref_usr_no) = trim(rtgs.utr)
+		and CH_NOBOOK.amt_txn = cast(rtgs.txn_amt as decimal(18,2))
+
+        left outer join
+    (SELECT * FROM db_smith.smth_pool_rtgs
+    where concat(codstatus,acctstatus,msgstatus) in ('21524','304','1739','206','1969','41516','17224',
+    '494','304','15154','4916','18164','15153','209','4915','4920','497')
+    and data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7))rtgs_rev_ret
+    on
+    coalesce(case
+    when ((CH_NOBOOK.txt_txn_desc like 'RTGS Rev%%' or CH_NOBOOK.txt_txn_desc like 'Reversal%%') and CH_NOBOOK.cod_drcr = 'C')
+    then trim(substr(CH_NOBOOK.txt_txn_desc,-22))
+    when (CH_NOBOOK.txt_txn_desc like 'RTGS-Return-%%' and CH_NOBOOK.cod_drcr = 'C')
+    then trim(CH_NOBOOK.ref_usr_no)
+    end,concat(CH_NOBOOK.dat_post,trim(CH_NOBOOK.cod_acct_no)))=coalesce(case
+        when (concat(rtgs_rev_ret.codstatus,rtgs_rev_ret.acctstatus,rtgs_rev_ret.msgstatus)in('494','4920') and rtgs_rev_ret.direction ='OUT')
+        THEN trim(rtgs_rev_ret.utr)
+        when (concat(rtgs_rev_ret.codstatus,rtgs_rev_ret.acctstatus,rtgs_rev_ret.msgstatus) 
+        not in ('494','4920') and rtgs_rev_ret.direction ='IN')
+        then trim(rtgs_rev_ret.utr)
+    end,concat(rtgs_rev_ret.data_dt,rtgs_rev_ret.direction,rtgs_rev_ret.utr))
+
+left outer join
+       (select * from db_smith.SMTH_POOL_IWCHQ where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2)) iwchq
+      on
+       (case when TRIM(CH_NOBOOK.ref_chq_no) is null or TRIM(CH_NOBOOK.ref_chq_no) = '' or trim(CH_NOBOOK.ref_chq_no)='000000000000'
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_chq_no) end) = iwchq.txn_ref_no
+        and trim(CH_NOBOOK.cod_acct_no) = trim(iwchq.remitter_account_no)
+        and CH_NOBOOK.amt_txn = cast(iwchq.txn_amt as double)
+        and iwchq.cod_site_reject is null
+        and CH_NOBOOK.ctr_batch_no = cast(iwchq.ctr_batch_no as int)
+
+
+left outer join
+      (SELECT * FROM db_smith.smth_pool_base_owchq where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2))owchq
+      on
+       trim(CH_NOBOOK.cod_acct_no)=trim(owchq.benef_account_no)
+        and (case when TRIM(CH_NOBOOK.ref_chq_no) is null or TRIM(CH_NOBOOK.ref_chq_no) = '' or trim(CH_NOBOOK.ref_chq_no)='000000000000'
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_chq_no) end) = (owchq.txn_ref_no)
+        and CH_NOBOOK.cod_txn_mnemonic = cast(owchq.cod_txn_mnemonic as int)
+        and CH_NOBOOK.ctr_batch_no = cast(owchq.ctr_batch_no as int)
+        and CH_NOBOOK.amt_txn = cast(owchq.txn_amt as double)
+        and CH_NOBOOK.ref_sub_seq_no = cast(owchq.ref_sub_seq_no as int)
+        and ch_nobook.ref_sys_tr_aud_no = cast(owchq.ref_sys_tr_aud_no as int)
+
+LEFT OUTER JOIN
+    (select * from db_smith.smth_pool_base_infra_trf
+    where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2)
+    )Intra_FT
+
+    on (case when TRIM(CH_NOBOOK.ref_txn_no) is null or TRIM(CH_NOBOOK.ref_txn_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_txn_no) end) = trim(Intra_FT.txn_ref_no)
+
+
+LEFT OUTER join
+    (select * from db_smith.smth_pool_esb_ecollect
+    where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7))esb_ecollect
+    on (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_usr_no) end) = trim(esb_ecollect.CREDIT_REQ_REF)
+        AND trim(CH_NOBOOK.cod_acct_no) = trim(esb_ecollect.benef_account_no)
+        and CH_NOBOOK.cod_drcr ='C'
+
+
+left outer join
+        (select * from db_smith.SMTH_POOL_DC where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),2))DC
+       on
+        trim(CH_NOBOOK.cod_acct_no) =  trim(DC.remitter_account_no)
+        and
+        (case when TRIM(CH_NOBOOK.ref_txn_no) is null or TRIM(CH_NOBOOK.ref_txn_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_txn_no) end) = trim(DC.txn_ref_no)
+
+
+LEFT OUTER JOIN
+        (select a.cod_acct_no,a.ref_txn_no,a.retrieval_ref_no,a.cod_txn_mnemonic,a.card_no,a.amt_txn_lcy,ca_term_id,dat_post_stl
+        from db_stage.stg_fcr_fcrlive_1_xf_ol_st_cotxn_mmdd a
+        where batch_id >= cast(unix_timestamp(date_add(to_date(current_timestamp()),-2),'yyyy-MM-dd')*1000 as string)
+        and to_date(a.dat_post_stl)>= date_sub(to_date(CURRENT_TIMESTAMP),2)
+        )ATM
+        on
+        trim(CH_NOBOOK.cod_acct_no) =  trim(ATM.cod_acct_no)
+        and trim(CH_NOBOOK.ref_txn_no) = trim(ATM.ref_txn_no)
+        AND CH_NOBOOK.cod_txn_mnemonic = CAST(ATM.cod_txn_mnemonic AS INT)
+        AND CH_NOBOOK.AMT_TXN_TCY = CAST(ATM.amt_txn_lcy AS DECIMAL(18,2))
+        and concat(CH_NOBOOK.year,'-',CH_NOBOOK.month,'-',CH_NOBOOK.`date`) = to_date(ATM.dat_post_stl)
+
+LEFT OUTER JOIN
+         (select * from db_smith.SMTH_POOL_NEFT a
+        WHERE a.data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+        and a.DIRECTION = 'IN')NEFT_IN
+        ON
+        (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_usr_no) end) = trim(NEFT_IN.iduserreference_2020)
+        and CH_NOBOOK.AMT_TXN = cast(NEFT_IN.txn_amt as decimal(18,2))
+        and trim(
+        substr(CH_NOBOOK.txt_txn_desc,(INSTR(CH_NOBOOK.txt_txn_desc,'-')+1),
+        (INSTR(CH_NOBOOK.txt_txn_desc,'-')+12 - INSTR(CH_NOBOOK.txt_txn_desc,'-')-1)
+        ))= trim(NEFT_IN.remitter_ifsc)
+        and CH_NOBOOK.cod_drcr = 'C'
+
+
+left outer join
+        (select a.* from db_smith.SMTH_POOL_NEFT a
+        WHERE a.data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+                and DIRECTION = 'OUT'
+                and concat(a.acctstatus,a.codstatus) = '94')NEFT_REV_ACK
+        ON
+        (case when CH_NOBOOK.cod_drcr = 'C'
+                then (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_usr_no) end)  else CH_NOBOOK.dat_txn end) = trim(NEFT_REV_ACK.iduserreference_2020)
+        and CH_NOBOOK.AMT_TXN = cast(NEFT_REV_ACK.txn_amt as decimal(18,2))
+
+left outer join
+        (select a.* from db_smith.SMTH_POOL_NEFT a
+                WHERE a.data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+                and DIRECTION = 'IN'
+                and TRIM(idrelatedref_2006) IS NOT NULL)NEFT_RET
+                ON
+                (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_usr_no) end ) = trim(NEFT_RET.iduserreference_2020)
+                and trim(substr
+                (CH_NOBOOK.txt_txn_desc,instr(CH_NOBOOK.txt_txn_desc,'-')+8,
+                (INSTR(CH_NOBOOK.txt_txn_desc,'-')+17 - INSTR(CH_NOBOOK.txt_txn_desc,'-')-1))) = TRIM(NEFT_RET.idrelatedref_2006)
+                and CH_NOBOOK.AMT_TXN = cast(NEFT_RET.txn_amt as decimal(18,2))
+                AND CH_NOBOOK.cod_drcr = 'C'
+
+LEFT OUTER JOIN
+        (select a.* from db_smith.SMTH_POOL_NEFT a
+        WHERE a.data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+        and DIRECTION = 'OUT')NEFT_OUT
+        ON
+        (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn else
+       TRIM(CH_NOBOOK.ref_usr_no) end) = trim(NEFT_OUT.iduserreference_2020)
+        and CH_NOBOOK.AMT_TXN = cast(NEFT_OUT.txn_amt as decimal(18,2))
+        AND CH_NOBOOK.cod_drcr = 'D'
+
+left outer join
+        (select * from  db_smith.SMTH_POOL_IMPS
+        where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+        and trim(push_pull) not in('NREPA')
+        )IMPS
+       ON
+          (case when (CH_NOBOOK.txt_txn_desc like 'IMPS/%%' or CH_NOBOOK.txt_txn_desc like '%%/RRN%%' or CH_NOBOOK.txt_txn_desc like '%%/IMPS/RRN:%%'
+            or CH_NOBOOK.txt_txn_desc LIKE '%%RRN : %%')
+          then (case when trim(CH_NOBOOK.ref_txn_no) is null then ch_nobook.dat_txn else trim(CH_NOBOOK.ref_txn_no)
+          end) else CH_NOBOOK.dat_txn  end)= (case when trim(IMPS.bank_ref_no) is null
+                                            then concat(IMPS.data_dt,IMPS.txn_amt) else trim(IMPS.bank_ref_no) end)
+
+
+LEFT OUTER JOIN
+        (select * from  db_smith.SMTH_POOL_IMPS where
+        data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+    and ((NPCI_RESP_CODE IN ('CE','NA','EE','M1','08','30','92','12','13','20','52','51','M2',
+        'M0','M3','M4','M5','94','96','MR','M6','75','MI','22') OR NPCI_RESP_CODE IS NULL)
+        AND BANK_RESPONSE_CODE NOT IN('EXT_RSP9010','EXT_RSP9035','2435')
+        ))imps_ref_null
+     on
+    (CASE
+    WHEN (
+(trim(CH_NOBOOK.ref_chq_no) LIKE '0%%' or trim(CH_NOBOOK.ref_chq_no) is null)
+AND (CH_NOBOOK.txt_txn_desc LIKE '%%/IMPS/RRN%%' OR CH_NOBOOK.txt_txn_desc LIKE 'IMPS%%' OR CH_NOBOOK.txt_txn_desc LIKE '%%/REV/RRN%%')
+)
+then
+(substr(REGEXP_EXTRACT(CH_NOBOOK.txt_txn_desc,'/RRN:(.*)',1),1,instr(
+REGEXP_EXTRACT(CH_NOBOOK.txt_txn_desc,'/RRN:(.*)',1),'/')-1))
+else (case when (trim(CH_NOBOOK.ref_chq_no) = '' or trim(CH_NOBOOK.ref_chq_no) is null or trim(CH_NOBOOK.ref_chq_no)='000000000000')
+then ch_nobook.dat_txn else trim(CH_NOBOOK.ref_chq_no)  end) end)=trim(imps_ref_null.txn_ref_no)
+AND TRIM(CASE WHEN CH_NOBOOK.amt_txn < 0 THEN SUBSTR(cast(CH_NOBOOK.amt_txn_tcy AS STRING),2)
+    ELSE CAST(CH_NOBOOK.amt_txn_tcy AS STRING) END) = CAST(CAST(imps_ref_null.txn_amt AS DECIMAL(18,2)) AS STRING)
+
+
+LEFT OUTER JOIN
+    (select a.* from db_smith.SMTH_POOL_UPI a
+    where   data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+    and a.currstatuscode ='3035')UPI_REV
+on
+    (case when trim(substr(CH_NOBOOK.txt_txn_desc,9,12)) ='' then CH_NOBOOK.dat_txn
+    else trim(substr(CH_NOBOOK.txt_txn_desc,9,12))
+    end) = trim(UPI_REV.custrefno)
+    and (case when upper(substr(CH_NOBOOK.txt_txn_desc,27,8)) is null or upper(substr(CH_NOBOOK.txt_txn_desc,27,8))=''
+        then CH_NOBOOK.dat_txn else upper(substr(CH_NOBOOK.txt_txn_desc,27,8)) end) = substr(UPPER(UPI_REV.payer_addr),1,8)
+    and CH_NOBOOK.amt_txn < 0
+    and CH_NOBOOK.txt_txn_desc like 'REV:UPI/%%'
+
+
+left outer JOIN
+(select a.* from db_smith.SMTH_POOL_UPI a
+where   a.data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+and a.paytype ='P2M'
+AND a.drcrflag = 'C'
+)UPI_P2M_POOL
+ON
+(CASE
+WHEN (CH_NOBOOK.cod_drcr = 'C' and CH_NOBOOK.ref_usr_no is null)
+THEN trim(substr(CH_NOBOOK.txt_txn_desc,5,12))
+else CH_NOBOOK.dat_txn
+end) = trim(UPI_P2M_POOL.custrefno)
+and CH_NOBOOK.amt_txn = (cast(cast(UPI_P2M_POOL.txn_amt as double)/100 as decimal(18,2)))
+and upper(substr(CH_NOBOOK.txt_txn_desc,instr(CH_NOBOOK.txt_txn_desc,':')+1,9)) = substr(UPPER(UPI_P2M_POOL.payer_addr),1,9)
+and CH_NOBOOK.txt_txn_desc like 'UPI/%%'
+and UPI_P2M_POOL.currstatuscode IN ('3030','1010','2240','3010','1030','3039','2210','1016','2228','3050','2220',
+                          '3036','8000','3035','8002','8004','3038')
+
+
+LEFT OUTER join
+(select * from db_smith.SMTH_POOL_UPI
+     where data_dt >= date_sub(to_date(CURRENT_TIMESTAMP),7)
+)UPI
+     ON
+       (CASE    WHEN CH_NOBOOK.cod_drcr = 'C'
+        THEN (case when length(CH_NOBOOK.ref_usr_no)=12
+          then substr(CH_NOBOOK.txt_txn_desc,5,12)
+          else (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn
+    else trim(CH_NOBOOK.ref_usr_no) end) end
+          )
+    when (CH_NOBOOK.cod_drcr = 'D' and CH_NOBOOK.amt_txn > 0)
+    then (case when TRIM(CH_NOBOOK.ref_usr_no) is null or TRIM(CH_NOBOOK.ref_usr_no) = ''
+       then CH_NOBOOK.dat_txn
+    else trim(CH_NOBOOK.ref_usr_no) end)
+    end)= (CASE WHEN UPI.drcrflag = 'C'
+            then (case when UPI.base_txn_text like 'Loading YesPay Wallet%%'
+                       then trim(UPI.custrefno) else CONCAT(TRIM(UPI.TXNID),'INW')end)
+        WHEN UPI.drcrflag = 'D'
+        THEN CONCAT(TRIM(UPI.TXNID),'OUT') end)
+    and UPI.currstatuscode IN ('3030','1010','2240','3010','1030','3039','2210','1016','2228','3050','2220',
+                          '3036','8000','3035','8002','8004','3038','2230','1015')
+    AND substr(CH_NOBOOK.txt_txn_desc,5,12) = trim(UPI.custrefno)
+
+"""% (data_dt,data_dt[:4],data_dt[5:7],data_dt[8:10],ccy_batch_id,usr_batch_id,data_dt,brn_batch_id)
+
+
+df=sqlContext.sql(pool).cache()
+
+category_master=sqlContext.table(category_master_tbl)
+
+
+
+df1=sqlContext.table(out_tbl)
+
+df2=(df.withColumn('category_code',
+    F.when(((F.col('nobook_txn_text').rlike('^IMPS\/NA\/XXX....\/REV\/RRN'))&(F.col('amount')<0))
+           |(F.col('nobook_txn_text').like('%NEFT-RETURN-%'))
+           |(F.col('nobook_txn_text').like('%RTGS-RETURN-%'))
+           |(F.col('nobook_txn_text').rlike('^REV:UPI/'))
+           ,'530000').otherwise(F.col('category_code'))))
+
+df3=(df2.withColumn('category_level1',F.when((F.col('category_code').isin('530000')),'TRANSACTION REVERSAL').otherwise(F.col('category_level1')))
+        .withColumn('category_level2',F.when((F.col('category_code').isin('530000')),'TRANSACTION REVERSAL').otherwise(F.col('category_level2')))
+     )
+
+df_classified=df3.filter(~((F.col('category_code').isNull())|(F.col('category_code').isin(''))))
+
+
+df_unclassified=(df3.filter((F.col('category_code').isNull())|(F.col('category_code').isin('')))
+                      .drop('category_code',
+                                                                'category_level1',
+                                                                'category_level2',
+                                                                'category_level3',
+                                                               )
+                 )
+
+
+
+
+root_path = '/ybl/dwh/artifacts/sherlock/pythonJobs'
+#root_path='/data/08/notebooks/tmp/Anisha/Prod_code/Deployed_codes_fw/'
+sc.addPyFile(root_path + '/Transaction-Classification/RemarksFW.py')
+from RemarksFW import *
+R_kp, R_result_dict = R_initialize(root_path, sc)
+
+
+df_res=R_get_txn_class_remark(root_path, sc, df_unclassified, 'nobook_txn_text', 'category_code', R_kp, R_result_dict,'510000')
+
+
+
+df_res1=df_res.join(F.broadcast(category_master),'category_code','left')
+
+
+df_pool=df_classified.unionAll(df_res1.select(df_classified.columns))
+
+df_pool1=(df_pool.withColumn('category_code',F.when( (F.col('self_flag').isin('1'))
+                                                        &(F.col('category_code').isin('510000')), '130100').
+                            otherwise(F.col('category_code'))
+                            )
+                .withColumn('category_level1',F.when( (F.col('self_flag').isin('1'))
+                                                        &(F.col('category_code').isin('510000')), 'PERSONAL TRANSFERS').
+                            otherwise(F.col('category_level1'))
+                            )
+                .withColumn('category_level2',F.when( (F.col('self_flag').isin('1'))
+                                                        &(F.col('category_code').isin('510000')), 'TRANSFER SELF').
+                            otherwise(F.col('category_level2'))
+                            )
+    )
+
+
+##EEM Integration script changes
+### EEM Integration
+def clean_account(acct_col):
+    return F.regexp_replace(F.trim(F.col(acct_col)),"^0+","")
+def get_ifsc_4(ifsc_col):
+    return F.upper(F.substring(F.trim(F.col(ifsc_col)), 1, 4))
+
+eem_master_df = (sqlContext.table(eem_master)
+                 .filter(F.col("is_validated")==1)
+                 .select(F.col("key").alias("entity_id"),
+                         F.col("category_code").alias("correct_category"))
+                )
+eem_mapper_df = sqlContext.table(eem_mapper).filter((F.col("entity_id").isNotNull())&(F.col("cust_category")!='I'))
+eem_mapper_df1 = eem_mapper_df.join(F.broadcast(eem_master_df),'entity_id')
+
+df_pool11 = (df_pool1.withColumn("classification_flag",
+                                 F.when(F.col("category_code").isin(["510000","170000"]),F.lit(0)).otherwise(F.lit(1)))
+             .withColumn("benef_account_no_clean",F.trim(clean_account("benef_account_no")))
+             .withColumn("benef_ifsc_clean",F.upper(F.trim(get_ifsc_4("benef_ifsc"))))
+             .withColumn("benef_name_clean",F.lower(F.trim(F.col("benef_name"))))
+             .withColumn("key",F.concat_ws('_',*[F.col("benef_ifsc_clean"),F.col("benef_account_no_clean")]))
+            )
+
+df_pool111 = df_pool11.filter(F.col("classification_flag")==0)
+eem_mapper_df2 = (eem_mapper_df1.withColumn("benef_ifsc_clean",F.upper(F.trim(get_ifsc_4("ifsc"))))
+                             .withColumn("benef_account_no_clean",F.trim(clean_account("account_number")))
+                             .withColumn("benef_name_clean",F.lower(F.trim(F.col("suggested_name"))))
+                             .withColumn("category_code_eem",F.col("correct_category"))
+                 )
+
+#EEM Integration Method 1
+eem_mapper_df21 = (eem_mapper_df2.filter(F.col('key').isNotNull()))
+df_pool1111 = (df_pool111.join(F.broadcast(eem_mapper_df21.select("key",
+                                                       "business_name",
+                                                       "category_code_eem")
+                                        .distinct())
+                            ,on=["key"],how="left")
+            ).drop('key')
+
+df_pool_method1 = df_pool1111.filter(F.col("category_code_eem").isNotNull())
+df_pool_method2 = (df_pool_method1
+                   .withColumn("benef_id",
+                               F.when(F.col("business_name").isNotNull(),F.col("business_name"))
+                               .otherwise(F.col("benef_id"))
+                              )
+                  )
+
+df_pool_method1_res = df_pool1111.filter(F.col("category_code_eem").isNull()).drop(*['business_name','category_code_eem'])
+
+#EEM Integration Method 2
+eem_mapper_df22 = (eem_mapper_df2.filter(F.col('benef_name_clean').isNotNull()))
+w = Window.partitionBy(F.col("benef_name_clean")).orderBy(F.col('entity_id').desc())
+eem_mapper_df22 = eem_mapper_df22.withColumn('r',F.row_number().over(w)).filter(F.col('r')==1).drop("r")
+df_pool_method1_res1 = (df_pool_method1_res.join(F.broadcast(eem_mapper_df22.select("benef_name_clean",
+                                                       "business_name",
+                                                       "category_code_eem")
+                                        .distinct())
+                            ,on=["benef_name_clean"],how="left")
+            ).drop('benef_name_clean')
+
+cols = df_pool1.columns+['business_name','category_code_eem']
+df_pool_eem_final = df_pool_method1_res1.select(cols).union(df_pool_method1.select(cols))
+df_pool_eem_final1 = (df_pool_eem_final
+                   .withColumn("benef_id",
+                               F.when(F.col("business_name").isNotNull(),F.col("business_name"))
+                               .otherwise(F.col("benef_id"))
+                              )
+                  )
+df_pool_eem_final2 = (df_pool_eem_final1
+                      .withColumn('category_code',
+                                  F.when(F.col('category_code_eem').isNull(),F.col('category_code')
+                                        ).otherwise(F.col('category_code_eem'))
+                                 )
+                     ).drop(*['category_code_eem','category_level1','category_level2','category_level3'])
+# integration with Category Master
+
+df_pool_eem_final3=df_pool_eem_final2.join(F.broadcast(category_master),'category_code','left')
+
+
+df_pool_eem_final4=df_pool_eem_final3.select(df_pool1.columns)
+
+df_pool_eem_final5=(df_pool_eem_final4.withColumn('category_code',F.when( (F.col('self_flag').isin('1'))
+                                                        &(F.col('category_code').isin('510000')), '130100').
+                            otherwise(F.col('category_code'))
+                            )
+                .withColumn('category_level1',F.when( (F.col('self_flag').isin('1'))
+                                                        &(F.col('category_code').isin('510000')), 'PERSONAL TRANSFERS').
+                            otherwise(F.col('category_level1'))
+                            )
+                .withColumn('category_level2',F.when( (F.col('self_flag').isin('1'))
+                                                        &(F.col('category_code').isin('510000')), 'TRANSFER SELF').
+                            otherwise(F.col('category_level2'))
+                            )
+    )
+
+df_pool_seg1 = df_pool11.filter(F.col("classification_flag")==1).select(df_pool1.columns)
+df_pool_seg2 = df_pool_eem_final5.select(df_pool1.columns)
+df_pool_with_eem = df_pool_seg1.union(df_pool_seg2)
+
+
+
+
+df_pool_with_eem.select(df1.columns).repartition('data_dt','partition_mode').write.insertInto(out_tbl,True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------------------------------------------------------------------------------------------------------------
 # coding: utf-8
 
 # In[16]:
